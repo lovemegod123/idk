@@ -55,8 +55,9 @@ async def _search(
 async def _ask_for_connection(input: ToolSearchInput, _context: Any):
     return PermissionAskDecision(
         message=(
-            "Connect to the user-configured local MCP stdio servers and search "
-            f"their tool catalog for {input.query!r}? The server process will run as this user."
+            "Connect to the user-configured MCP servers and search "
+            f"their tool catalog for {input.query!r}? This may launch a local process "
+            "as this user or contact a remote server."
         ),
         decision_reason=OtherReason(reason="mcp_server_connection"),
         updated_input=input.model_dump(),
@@ -80,8 +81,9 @@ ToolSearchTool = build_tool(
     ),
     prompt=(
         "Use ToolSearch when an external capability may help. It connects only to "
-        "user-configured stdio MCP servers after interactive approval and activates "
-        "a small matching set of schemas. Each MCP tool call separately requires approval."
+        "user-configured local stdio or remote Streamable HTTP MCP servers after "
+        "interactive approval and activates a small matching set of schemas. "
+        "Each MCP tool call separately requires approval."
     ),
     input_schema=ToolSearchInput,
     call=_search,

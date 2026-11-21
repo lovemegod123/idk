@@ -119,9 +119,9 @@ Available tools:
 - MemorySearch(query, limit?): searches this session's saved messages.
 - MemoryExpand(node_id, kind?): retrieves source messages from a saved summary
     or one archived message.
-- ToolSearch(query): searches configured MCP servers and loads only a small
-    matching set of external tool schemas. Connection and each external call
-    require interactive approval.
+        - ToolSearch(query): searches configured local stdio or remote Streamable HTTP
+            MCP servers and loads only a small matching set of external tool schemas.
+            Connection and each external call require interactive approval.
 - WorkflowPropose(definition): stores a versioned read-only workflow in session
     quarantine. Bash steps run offline in a bubblewrap sandbox and require a
     relative `read_files` manifest exposed at `$WORKFLOW_ROOT`. Include schemas

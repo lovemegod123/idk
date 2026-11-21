@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import time
 import uuid
 from datetime import datetime
@@ -13,12 +14,13 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
-    Button, Collapsible, Footer, Header, Input, Label, LoadingIndicator,
-    Markdown, Static,
+    Button, Checkbox, Collapsible, Footer, Header, Input, Label,
+    LoadingIndicator, Markdown, Select, Static,
 )
 
 from api import get_active_model, list_models, set_active_model
 from main import _persist_query_messages, build_context, build_full_system_prompt
+from mcp_runtime import format_connection_error
 from messages import (
     AssistantMessage, ProgressMessage, ToolResultBlock, ToolResultMessage,
     ToolUseBlock, UserMessage as AgentUserMessage, create_assistant_message,
@@ -218,7 +220,7 @@ class AgentApp(App):
     #workspace { height: 1fr; min-height: 8; }
     #session-sidebar { width: 30; min-width: 24; padding: 1; border-right: tall $primary; }
     #sidebar-title { height: 1; margin-bottom: 1; text-style: bold; color: $accent; }
-    #new-session-button, #tools-button { width: 1fr; height: 3; margin-bottom: 1; }
+    #new-session-button, #activity-button, #tools-button, #connections-button, #settings-button { width: 1fr; height: 3; margin-bottom: 1; }
     #session-filter { margin-bottom: 1; }
     #session-list { height: 1fr; min-height: 5; }
     .session-button { width: 1fr; height: 3; margin-bottom: 1; content-align: left middle; }
@@ -226,6 +228,7 @@ class AgentApp(App):
     #main-pane { width: 1fr; }
     #session-heading { height: 2; padding: 0 2; background: $panel; content-align: left middle; }
     #transcript { height: 1fr; min-height: 8; padding: 0 2; }
+    #activity-view { height: 1fr; min-height: 8; padding: 1 2; }
     UserMessage { margin: 1 0 0 0; padding: 0 1; border-left: thick $accent; }
     StreamingMarkdown { margin: 0 0 1 2; padding: 0 1; }
     ToolCard { margin: 0 0 1 2; }
@@ -236,7 +239,22 @@ class AgentApp(App):
     #activity { width: 1fr; }
     #tokens { width: 16; text-align: right; }
     #composer { height: 3; margin: 0 2 1 2; border: tall $accent; }
+    #runtime-view { height: 1fr; min-height: 8; padding: 1 2; }
+    #runtime-view Label { margin-bottom: 1; text-style: bold; color: $accent; }
+    #model-override { margin: 1 0; }
+    #runtime-info { margin-top: 1; color: $text-muted; }
     #tools-view { height: 1fr; padding: 1 2; }
+    #connections-view { height: 1fr; padding: 1 2; }
+    #connections-title { height: 2; text-style: bold; color: $accent; }
+    #mcp-help, #mcp-form-status { height: auto; margin-bottom: 1; color: $text-muted; }
+    #mcp-form-collapse { height: auto; max-height: 15; margin-top: 1; }
+    #mcp-form { height: auto; padding: 0 1; }
+    #mcp-form Input, #mcp-form Select { margin-bottom: 1; }
+    #mcp-oauth { margin-bottom: 1; }
+    #mcp-servers-list { height: 1fr; min-height: 6; }
+    .mcp-server-row { height: auto; min-height: 4; margin-bottom: 1; padding: 0 1; border-bottom: solid $primary-darken-2; }
+    .mcp-server-details { width: 1fr; height: auto; padding: 1 0; }
+    .mcp-connect-button, .mcp-remove-button { width: 14; height: 3; margin: 0 1; }
     #permission-dialog { width: 72; height: auto; padding: 1 2; border: thick $warning; background: $surface; }
     #permission-title { text-style: bold; color: $warning; margin-bottom: 1; }
     #permission-message { max-height: 12; margin-bottom: 1; }
@@ -249,7 +267,10 @@ class AgentApp(App):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "new_session", "New session"),
         Binding("ctrl+1", "show_current", "Current"),
-        Binding("ctrl+2", "show_tools", "Tools"),
+        Binding("ctrl+2", "show_activity", "Activity"),
+        Binding("ctrl+3", "show_tools", "Tools"),
+        Binding("ctrl+4", "show_settings", "Settings"),
+        Binding("ctrl+5", "show_connections", "Connections"),
     ]
 
     def __init__(self) -> None:
@@ -260,10 +281,13 @@ class AgentApp(App):
         self._current_markdown: StreamingMarkdown | None = None
         self._tool_cards: dict[str, ToolCard] = {}
         self._turn_tokens = 0
+        self._turn_had_visible_output = False
         self._exit_when_idle = False
         self._permission_lock = asyncio.Lock()
         self._permission_waiters = 0
         self._session_buttons: dict[str, str] = {}
+        self._mcp_action_targets: dict[str, tuple[str, str]] = {}
+        self._activity_entries: dict[str, list[tuple[str, str, str]]] = {}
         self._selected_session_id = self.ctx.session_id
         self._active_view = "current"
 
@@ -273,7 +297,10 @@ class AgentApp(App):
             with Vertical(id="session-sidebar"):
                 yield Label("RECENT SESSIONS", id="sidebar-title")
                 yield Button("+ New session", id="new-session-button", variant="primary")
+                yield Button("Agent activity", id="activity-button")
                 yield Button("Tool catalog", id="tools-button")
+                yield Button("MCP connections", id="connections-button")
+                yield Button("Runtime settings", id="settings-button")
                 yield Input(placeholder="Filter sessions", id="session-filter")
                 with VerticalScroll(id="session-list"):
                     pass
@@ -282,8 +309,69 @@ class AgentApp(App):
                 yield Label("CURRENT SESSION", id="session-heading")
                 with VerticalScroll(id="transcript"):
                     pass
+                with VerticalScroll(id="activity-view"):
+                    yield Static("Agent activity will appear here.", id="activity-empty", markup=False)
+                with VerticalScroll(id="runtime-view"):
+                    yield Label("AGENT RUNTIME")
+                    yield Static("Choose the active model used by the parent agent.", markup=False)
+                    yield Input(placeholder="provider/model-id", id="model-override")
+                    yield Button("Apply model", id="apply-model-button", variant="primary")
+                    yield Static("", id="runtime-info", markup=False)
                 with VerticalScroll(id="tools-view"):
                     yield Static("", id="tool-catalog", markup=False)
+                with VerticalScroll(id="connections-view"):
+                    yield Label("MCP CONNECTIONS", id="connections-title")
+                    yield Static(
+                        "Connect trusted local servers or remote HTTPS MCP endpoints. "
+                        "Local commands run as your user; remote OAuth opens your browser.",
+                        id="mcp-help",
+                        markup=False,
+                    )
+                    with VerticalScroll(id="mcp-servers-list"):
+                        pass
+                    with Collapsible(title="Add connector", collapsed=False, id="mcp-form-collapse"):
+                        with Vertical(id="mcp-form"):
+                            yield Input(placeholder="Server name (letters, numbers, . _ -)", id="mcp-name")
+                            yield Input(placeholder="Description (optional)", id="mcp-description")
+                            yield Select(
+                                [("Local stdio command", "stdio"), ("Remote Streamable HTTP", "streamable_http")],
+                                value="stdio",
+                                id="mcp-transport",
+                            )
+                            yield Input(placeholder="Command or HTTPS MCP endpoint URL", id="mcp-endpoint")
+                            yield Input(placeholder="Arguments (optional; no shell)", id="mcp-args")
+                            yield Checkbox(
+                                "Use browser OAuth for remote server",
+                                value=True,
+                                id="mcp-oauth",
+                            )
+                            yield Input(
+                                placeholder="Public OAuth client metadata URL (CIMD, optional)",
+                                id="mcp-oauth-metadata",
+                            )
+                            yield Input(
+                                placeholder="OAuth redirect URI override (optional)",
+                                id="mcp-oauth-redirect",
+                            )
+                            yield Input(
+                                placeholder="Pre-registered OAuth client ID (optional)",
+                                id="mcp-oauth-client-id",
+                            )
+                            yield Select(
+                                [
+                                    ("Public client (no secret)", "none"),
+                                    ("Client secret (HTTP Basic)", "client_secret_basic"),
+                                    ("Client secret (form body)", "client_secret_post"),
+                                ],
+                                value="none",
+                                id="mcp-oauth-auth-method",
+                            )
+                            yield Input(
+                                placeholder="Client secret environment variable name (not value)",
+                                id="mcp-oauth-secret-env",
+                            )
+                            yield Button("Save and connect", id="mcp-save-connect-button", variant="primary")
+                            yield Static("", id="mcp-form-status", markup=False)
                 yield PlanPanel()
                 yield StatusBar(id="status")
                 yield Input(placeholder="Message the agent...  (/help for commands)", id="composer")
@@ -297,7 +385,17 @@ class AgentApp(App):
             f"Ready on {get_active_model()} | {len(all_tools())} tools",
         ))
         self.query_one("#tools-view").display = False
+        self.query_one("#connections-view").display = False
+        self.query_one("#activity-view").display = False
+        self.query_one("#runtime-view").display = False
+        self._refresh_runtime_view()
+        self.query_one("#mcp-oauth-metadata", Input).display = False
+        self.query_one("#mcp-oauth-redirect", Input).display = False
+        self.query_one("#mcp-oauth-client-id", Input).display = False
+        self.query_one("#mcp-oauth-auth-method", Select).display = False
+        self.query_one("#mcp-oauth-secret-env", Input).display = False
         await self._refresh_sessions()
+        await self._refresh_mcp_connections()
         self._refresh_sidebar_status()
         self._refresh_plan()
 
@@ -313,12 +411,73 @@ class AgentApp(App):
     def on_tools_button(self, _event: Button.Pressed) -> None:
         self.action_show_tools()
 
+    @on(Button.Pressed, "#connections-button")
+    async def on_connections_button(self, _event: Button.Pressed) -> None:
+        await self.action_show_connections()
+
+    @on(Select.Changed, "#mcp-transport")
+    def on_mcp_transport_changed(self, event: Select.Changed) -> None:
+        is_stdio = event.value == "stdio"
+        self.query_one("#mcp-args", Input).display = is_stdio
+        self.query_one("#mcp-oauth", Checkbox).display = not is_stdio
+        oauth_fields_visible = not is_stdio and self.query_one("#mcp-oauth", Checkbox).value
+        self.query_one("#mcp-oauth-metadata", Input).display = oauth_fields_visible
+        self.query_one("#mcp-oauth-redirect", Input).display = oauth_fields_visible
+        self.query_one("#mcp-oauth-client-id", Input).display = oauth_fields_visible
+        self.query_one("#mcp-oauth-auth-method", Select).display = oauth_fields_visible
+        self.query_one("#mcp-oauth-secret-env", Input).display = oauth_fields_visible
+        self.query_one("#mcp-endpoint", Input).placeholder = (
+            "Command (for example: uvx server-package)"
+            if is_stdio else "HTTPS MCP endpoint URL"
+        )
+
+    @on(Checkbox.Changed, "#mcp-oauth")
+    def on_mcp_oauth_changed(self, event: Checkbox.Changed) -> None:
+        is_remote = self.query_one("#mcp-transport", Select).value == "streamable_http"
+        visible = is_remote and event.value
+        self.query_one("#mcp-oauth-metadata", Input).display = visible
+        self.query_one("#mcp-oauth-redirect", Input).display = visible
+        self.query_one("#mcp-oauth-client-id", Input).display = visible
+        self.query_one("#mcp-oauth-auth-method", Select).display = visible
+        self.query_one("#mcp-oauth-secret-env", Input).display = visible
+
+    @on(Button.Pressed, "#mcp-save-connect-button")
+    async def on_mcp_save_connect_button(self, _event: Button.Pressed) -> None:
+        await self._save_and_connect_mcp()
+
+    @on(Button.Pressed, ".mcp-connect-button")
+    async def on_mcp_connect_button(self, event: Button.Pressed) -> None:
+        action, name = self._mcp_action_targets.get(event.button.id or "", ("", ""))
+        if action == "connect":
+            await self._connect_mcp_server(name)
+        elif action == "disconnect":
+            await self._disconnect_mcp_server(name)
+
+    @on(Button.Pressed, ".mcp-remove-button")
+    async def on_mcp_remove_button(self, event: Button.Pressed) -> None:
+        action, name = self._mcp_action_targets.get(event.button.id or "", ("", ""))
+        if action == "remove" and name:
+            await self._remove_mcp_server(name)
+
+    @on(Button.Pressed, "#activity-button")
+    def on_activity_button(self, _event: Button.Pressed) -> None:
+        self.action_show_activity()
+
+    @on(Button.Pressed, "#settings-button")
+    def on_settings_button(self, _event: Button.Pressed) -> None:
+        self.action_show_settings()
+
+    @on(Button.Pressed, "#apply-model-button")
+    def on_apply_model_button(self, _event: Button.Pressed) -> None:
+        self._apply_model_override()
+
     @on(Button.Pressed, ".session-button")
     async def on_session_button(self, event: Button.Pressed) -> None:
         session_id = self._session_buttons.get(event.button.id or "")
         if session_id:
             await self._select_session(session_id)
 
+    @on(Input.Submitted, "#composer")
     @on(Input.Submitted, "#composer")
     def on_submit(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -332,6 +491,10 @@ class AgentApp(App):
             return
         self._append_widget(UserMessage(text))
         self._start_turn(text)
+
+    @on(Input.Submitted, "#model-override")
+    def on_model_override_submitted(self, _event: Input.Submitted) -> None:
+        self._apply_model_override()
 
     def _handle_command(self, text: str) -> bool:
         if text in ("/quit", "/exit", "/q"):
@@ -369,6 +532,7 @@ class AgentApp(App):
     def _start_turn(self, text: str) -> None:
         self.ctx.abort_controller = AbortController()
         self._turn_tokens = 0
+        self._turn_had_visible_output = False
         self._current_markdown = None
         self._tool_cards.clear()
         composer = self.query_one("#composer", Input)
@@ -391,6 +555,13 @@ class AgentApp(App):
         )
         try:
             async for event in query(params):
+                if getattr(event, "type", None) in ("assistant", "tool_result", "user"):
+                    message_uuid = getattr(event, "uuid", None)
+                    if not message_uuid or not any(
+                        getattr(message, "uuid", None) == message_uuid
+                        for message in state.messages
+                    ):
+                        state.messages.append(event)
                 await self._dispatch_event(event)
         except Exception as error:
             self._append_widget(SystemNotice(
@@ -414,6 +585,11 @@ class AgentApp(App):
         if isinstance(event, Terminal):
             if event.reason != "completed":
                 self._append_widget(SystemNotice(f"Turn ended: {event.reason}", "warn"))
+            elif not self._turn_had_visible_output:
+                self._append_widget(SystemNotice(
+                    "The model completed without a visible response. Check provider activity or retry.",
+                    "warn",
+                ))
             return
         if isinstance(event, dict):
             if event.get("type") == "stream_request_start":
@@ -427,8 +603,10 @@ class AgentApp(App):
         event_type = getattr(event, "type", None)
         if event_type == "assistant":
             if getattr(event, "is_api_error", False):
+                self._turn_had_visible_output = True
                 self._append_widget(SystemNotice(event.content or "Provider error", "error"))
-            elif event.content:
+            elif isinstance(event.content, str) and event.content.strip():
+                self._turn_had_visible_output = True
                 if self._current_markdown is None:
                     self._current_markdown = StreamingMarkdown()
                     self._append_widget(self._current_markdown)
@@ -469,9 +647,7 @@ class AgentApp(App):
                 if error_type:
                     detail += f" · {error_type}"
                 level = "error" if status == "failed" else "warn" if status == "blocked" else "info"
-                self._append_widget(SystemNotice(
-                    f"Task {task_id}: {status}{detail}", level,
-                ))
+                self._record_activity(f"Task {task_id}: {status}{detail}", level)
             elif data.get("type") in ("plan_activity", "memory_activity"):
                 self._show_runtime_activity(data)
             elif data.get("type") == "bash_progress":
@@ -574,7 +750,7 @@ class AgentApp(App):
         if store is None or session_id == self._selected_session_id:
             return
 
-        rows = store.get_session_messages(session_id, limit=200)
+        rows = store.get_session_messages(session_id, limit=1_000)
         restored = []
         for row in rows:
             role = row.get("role")
@@ -654,6 +830,8 @@ class AgentApp(App):
                         "error" if message.is_error else "info",
                     ))
 
+        self.call_after_refresh(transcript.scroll_end, animate=False)
+
         session = next(
             (item for item in store.list_sessions(limit=100)
              if item["session_id"] == session_id),
@@ -665,11 +843,15 @@ class AgentApp(App):
         self._show_current_view()
         self._refresh_plan()
         await self._refresh_sessions()
+        await self._refresh_activity_view()
         self._update_header()
 
     def _show_current_view(self) -> None:
         self._active_view = "current"
         self.query_one("#tools-view").display = False
+        self.query_one("#connections-view").display = False
+        self.query_one("#activity-view").display = False
+        self.query_one("#runtime-view").display = False
         self.query_one("#transcript").display = True
         self.query_one(PlanPanel).display = True
         self.query_one(StatusBar).display = True
@@ -677,6 +859,30 @@ class AgentApp(App):
 
     def action_show_current(self) -> None:
         self._show_current_view()
+        self.query_one("#composer", Input).focus()
+
+    def action_show_activity(self) -> None:
+        self._active_view = "activity"
+        self.query_one("#transcript").display = False
+        self.query_one("#tools-view").display = False
+        self.query_one("#connections-view").display = False
+        self.query_one("#runtime-view").display = False
+        self.query_one("#activity-view").display = True
+        self.query_one(PlanPanel).display = True
+        self.query_one(StatusBar).display = True
+        self.query_one("#composer", Input).display = True
+
+    def action_show_settings(self) -> None:
+        self._active_view = "settings"
+        self.query_one("#transcript").display = False
+        self.query_one("#activity-view").display = False
+        self.query_one("#tools-view").display = False
+        self.query_one("#runtime-view").display = True
+        self.query_one(PlanPanel).display = False
+        self.query_one("#connections-view").display = False
+        self.query_one(StatusBar).display = True
+        self.query_one("#composer", Input).display = False
+        self._refresh_runtime_view()
 
     def action_show_tools(self) -> None:
         tools_view = self.query_one("#tools-view", VerticalScroll)
@@ -686,11 +892,235 @@ class AgentApp(App):
             for tool in all_tools()
         ))
         self.query_one("#transcript").display = False
+        self.query_one("#activity-view").display = False
+        self.query_one("#runtime-view").display = False
+        self.query_one("#connections-view").display = False
         self.query_one(PlanPanel).display = False
         self.query_one(StatusBar).display = False
         self.query_one("#composer", Input).display = False
         tools_view.display = True
         self._active_view = "tools"
+
+    async def action_show_connections(self) -> None:
+        self._active_view = "connections"
+        self.query_one("#transcript").display = False
+        self.query_one("#activity-view").display = False
+        self.query_one("#runtime-view").display = False
+        self.query_one("#tools-view").display = False
+        self.query_one(PlanPanel).display = False
+        self.query_one(StatusBar).display = True
+        self.query_one("#composer", Input).display = False
+        self.query_one("#connections-view").display = True
+        await self._refresh_mcp_connections()
+
+    async def _refresh_mcp_connections(self) -> None:
+        manager = getattr(self.ctx, "mcp_manager", None)
+        server_list = self.query_one("#mcp-servers-list", VerticalScroll)
+        await server_list.remove_children()
+        self._mcp_action_targets.clear()
+        if manager is None:
+            server_list.mount(Static("MCP manager is unavailable.", markup=False))
+            return
+
+        servers = manager.configured_servers()
+        if not servers:
+            server_list.mount(Static("No MCP connectors configured yet.", markup=False))
+            return
+
+        for index, (name, config) in enumerate(sorted(servers.items())):
+            connection = manager._connections.get(name)
+            transport = config.get("transport", "stdio")
+            endpoint = config.get("url") if transport == "streamable_http" else config.get("command")
+            description = str(config.get("description") or "").strip()
+            state = (
+                f"CONNECTED · {len(connection.tool_names)} tools"
+                if connection else "DISCONNECTED"
+            )
+            details = f"{name} · {transport} · {state}"
+            if endpoint:
+                details += f"\n{endpoint}"
+            if description:
+                details += f"\n{description}"
+            action_id = f"mcp-connect-{index}"
+            self._mcp_action_targets[action_id] = (
+                "disconnect" if connection else "connect", name,
+            )
+            connect_button = Button(
+                "Disconnect" if connection else "Connect",
+                id=action_id,
+                classes="mcp-connect-button",
+                variant="warning" if connection else "primary",
+            )
+            remove_id = f"mcp-remove-{index}"
+            self._mcp_action_targets[remove_id] = ("remove", name)
+            remove_button = Button(
+                "Remove",
+                id=remove_id,
+                classes="mcp-remove-button",
+                disabled=bool(connection),
+                variant="error",
+            )
+            server_list.mount(Horizontal(
+                Static(details, classes="mcp-server-details", markup=False),
+                connect_button,
+                remove_button,
+                classes="mcp-server-row",
+            ))
+
+    def _mcp_form_status(self, text: str, level: str = "info") -> None:
+        status = self.query_one("#mcp-form-status", Static)
+        status.update(text)
+        if level == "error":
+            status.add_class("error")
+        else:
+            status.remove_class("error")
+
+    def _mcp_error_text(self, error: Exception) -> str:
+        return format_connection_error(error)
+
+    async def _confirm_mcp_connection(self, name: str, config: dict[str, Any]) -> bool:
+        transport = config.get("transport", "stdio")
+        endpoint = config.get("url") if transport == "streamable_http" else config.get("command")
+        args = config.get("args") or []
+        detail = f"Connect to MCP server {name!r} using {transport}.\nEndpoint/command: {endpoint}"
+        if args:
+            detail += "\nArguments: " + " ".join(args)
+        if transport == "stdio":
+            detail += "\nThe local process will run as your operating-system user."
+        elif config.get("oauth", {}) is not False:
+            detail += "\nBrowser OAuth may request access to the scopes listed by the server."
+        return bool(await self.push_screen_wait(PermissionScreen(detail)))
+
+    async def _connect_mcp_server(self, name: str) -> None:
+        if self._worker is not None and not self._worker.is_finished:
+            self._mcp_form_status("Wait for the active agent turn before changing connectors.", "error")
+            return
+        manager = self.ctx.mcp_manager
+        config = manager.configured_servers().get(name)
+        if config is None:
+            self._mcp_form_status("Connector configuration was not found.", "error")
+            await self._refresh_mcp_connections()
+            return
+        if not await self._confirm_mcp_connection(name, config):
+            self._mcp_form_status(f"Connection to {name} cancelled.")
+            return
+        try:
+            await manager.connect([name])
+        except Exception as error:
+            self._mcp_form_status(
+                f"Could not connect {name}: {self._mcp_error_text(error)}",
+                "error",
+            )
+            self._record_activity(f"MCP connection failed: {name} ({type(error).__name__})", "error")
+        else:
+            self.ctx.active_mcp_tool_names = set()
+            self._mcp_form_status(f"Connected {name}.")
+            self._record_activity(f"MCP connected: {name}")
+        await self._refresh_mcp_connections()
+        self._refresh_sidebar_status()
+        self._refresh_runtime_view()
+
+    async def _disconnect_mcp_server(self, name: str) -> None:
+        if self._worker is not None and not self._worker.is_finished:
+            self._mcp_form_status("Wait for the active agent turn before changing connectors.", "error")
+            return
+        manager = self.ctx.mcp_manager
+        await manager.disconnect_server(name)
+        self.ctx.active_mcp_tool_names = set()
+        self._mcp_form_status(f"Disconnected {name}.")
+        self._record_activity(f"MCP disconnected: {name}")
+        await self._refresh_mcp_connections()
+        self._refresh_sidebar_status()
+        self._refresh_runtime_view()
+
+    async def _remove_mcp_server(self, name: str) -> None:
+        if self._worker is not None and not self._worker.is_finished:
+            self._mcp_form_status("Wait for the active agent turn before changing connectors.", "error")
+            return
+        manager = self.ctx.mcp_manager
+        if name in manager._connections:
+            self._mcp_form_status("Disconnect this connector before removing it.", "error")
+            return
+        if not await self.push_screen_wait(PermissionScreen(
+            f"Remove saved MCP connector {name!r}? This will not revoke credentials at the provider."
+        )):
+            self._mcp_form_status(f"Removal of {name} cancelled.")
+            return
+        manager.remove_server_config(name)
+        self._mcp_form_status(f"Removed {name}.")
+        await self._refresh_mcp_connections()
+        self._refresh_sidebar_status()
+
+    async def _save_and_connect_mcp(self) -> None:
+        if self._worker is not None and not self._worker.is_finished:
+            self._mcp_form_status("Wait for the active agent turn before changing connectors.", "error")
+            return
+        name = self.query_one("#mcp-name", Input).value.strip()
+        description = self.query_one("#mcp-description", Input).value.strip()
+        transport = self.query_one("#mcp-transport", Select).value
+        endpoint = self.query_one("#mcp-endpoint", Input).value.strip()
+        config: dict[str, Any] = {"transport": transport}
+        if description:
+            config["description"] = description
+        if transport == "stdio":
+            try:
+                config["args"] = shlex.split(self.query_one("#mcp-args", Input).value)
+            except ValueError as error:
+                self._mcp_form_status(f"Invalid argument quoting: {error}", "error")
+                return
+            config["command"] = endpoint
+        else:
+            config["url"] = endpoint
+            if self.query_one("#mcp-oauth", Checkbox).value:
+                oauth: dict[str, str] = {}
+                metadata_url = self.query_one("#mcp-oauth-metadata", Input).value.strip()
+                redirect_uri = self.query_one("#mcp-oauth-redirect", Input).value.strip()
+                client_id = self.query_one("#mcp-oauth-client-id", Input).value.strip()
+                secret_env = self.query_one("#mcp-oauth-secret-env", Input).value.strip()
+                auth_method = self.query_one("#mcp-oauth-auth-method", Select).value
+                if metadata_url:
+                    oauth["client_metadata_url"] = metadata_url
+                if redirect_uri:
+                    oauth["redirect_uri"] = redirect_uri
+                if client_id:
+                    oauth["client_id"] = client_id
+                    oauth["token_endpoint_auth_method"] = auth_method
+                if secret_env:
+                    oauth["client_secret_env"] = secret_env
+                config["oauth"] = oauth
+            else:
+                config["oauth"] = False
+
+        manager = self.ctx.mcp_manager
+        try:
+            existing = manager.configured_servers().get(name)
+            if existing is not None and name in manager._connections:
+                raise ValueError("Disconnect this MCP server before editing its configuration")
+            if not await self._confirm_mcp_connection(name, config):
+                self._mcp_form_status("Connector setup cancelled.")
+                return
+            manager.save_server_config(name, config)
+            await manager.connect([name])
+        except Exception as error:
+            self._mcp_form_status(
+                f"Could not save/connect {name or 'connector'}: {self._mcp_error_text(error)}",
+                "error",
+            )
+            self._record_activity(
+                f"MCP connection failed: {name or 'connector'} ({type(error).__name__})",
+                "error",
+            )
+        else:
+            self.ctx.active_mcp_tool_names = set()
+            self._mcp_form_status(f"Connected {name}.")
+            self.query_one("#mcp-name", Input).value = ""
+            self.query_one("#mcp-description", Input).value = ""
+            self.query_one("#mcp-endpoint", Input).value = ""
+            self.query_one("#mcp-args", Input).value = ""
+            self._record_activity(f"MCP connected: {name}")
+        await self._refresh_mcp_connections()
+        self._refresh_sidebar_status()
+        self._refresh_runtime_view()
 
     def _show_runtime_activity(self, event: dict) -> None:
         area = event.get("area")
@@ -754,7 +1184,74 @@ class AgentApp(App):
                 text += f" · request {event['request_id']}"
         else:
             return
+        self._record_activity(text, level)
+
+    def _record_activity(self, text: str, level: str = "info") -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        session_id = str(getattr(self.ctx, "session_id", "session"))
+        entries = self._activity_entries.setdefault(session_id, [])
+        entries.append((timestamp, text, level))
+        del entries[:-200]
         self._append_widget(SystemNotice(text, level))
+        activity_view = self.query_one("#activity-view", VerticalScroll)
+        empty = activity_view.query_one("#activity-empty", Static) if activity_view.query("#activity-empty") else None
+        if empty is not None:
+            empty.remove()
+        if session_id == self._selected_session_id:
+            activity_view.mount(SystemNotice(f"{timestamp}  {text}", level))
+
+    async def _refresh_activity_view(self) -> None:
+        activity_view = self.query_one("#activity-view", VerticalScroll)
+        await activity_view.remove_children()
+        entries = self._activity_entries.get(self._selected_session_id, [])
+        if not entries:
+            activity_view.mount(Static(
+                "Agent activity will appear here.",
+                id="activity-empty",
+                markup=False,
+            ))
+            return
+        for timestamp, text, level in entries:
+            activity_view.mount(SystemNotice(f"{timestamp}  {text}", level))
+
+    def _refresh_runtime_view(self) -> None:
+        model_input = self.query_one("#model-override", Input)
+        model_input.value = get_active_model()
+        try:
+            from model_router import load_tier_configuration
+
+            tiers = load_tier_configuration().tiers
+            tier_lines = [f"{tier}: {profile.model}" for tier, profile in tiers.items()]
+        except Exception as error:
+            tier_lines = [f"Worker tiers unavailable: {type(error).__name__}"]
+        manager = getattr(self.ctx, "mcp_manager", None)
+        connected = len(getattr(manager, "_connections", {})) if manager else 0
+        lines = [
+            f"Active model: {get_active_model()}",
+            "Worker routing (configured): " + "; ".join(tier_lines),
+            f"Registered tools: {len(all_tools())}",
+            f"MCP servers connected: {connected}",
+            "Task workers: scoped Read/Edit/Write; no Bash or MCP",
+            "Wide Task execution is gated by the planner estimate and DAG contract.",
+        ]
+        self.query_one("#runtime-info", Static).update("\n".join(lines))
+
+    def _apply_model_override(self) -> None:
+        if self._worker is not None and not self._worker.is_finished:
+            self._record_activity("Wait for the active turn before changing models.", "warn")
+            return
+        model = self.query_one("#model-override", Input).value.strip()
+        if not model:
+            self._record_activity("Model was not changed: enter a model ID.", "warn")
+            return
+        try:
+            set_active_model(model)
+        except Exception as error:
+            self._record_activity(f"Model change failed: {error}", "error")
+            return
+        self._update_header()
+        self._refresh_runtime_view()
+        self._record_activity(f"Active model changed to {model}.")
 
     def _summarize_input(self, inputs: Any) -> str:
         if not isinstance(inputs, dict):
@@ -800,6 +1297,7 @@ class AgentApp(App):
         state.read_file_cache = FileStateCache()
         self.ctx.read_file_state = state.read_file_cache
         self.ctx.session_id = f"ui-{uuid.uuid4().hex[:12]}"
+        self._selected_session_id = self.ctx.session_id
         self.ctx.active_mcp_tool_names = set()
         self.ctx._stored_message_ids = []
         self.ctx._stored_message_uuids = set()
@@ -811,6 +1309,7 @@ class AgentApp(App):
         self._show_current_view()
         self._refresh_plan()
         await self._refresh_sessions()
+        await self._refresh_activity_view()
         self._refresh_sidebar_status()
         self._append_widget(SystemNotice("Started a fresh session."))
 

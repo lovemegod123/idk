@@ -1,6 +1,6 @@
 # Schema Manager Agent Guide
 
-Last updated: 2026-11-12. This guide describes the checked-in Python runtime and the current evidence state. For the active roadmap, see `memory/plan_mode.md`; for a compact status snapshot, see `memory/schema-manager-overview.md`.
+Last updated: 2026-11-21. This guide describes the checked-in Python runtime and the current evidence state. For the active roadmap, see `memory/plan_mode.md`; for a compact status snapshot, see `memory/schema-manager-overview.md`.
 
 ## 1. Purpose and design
 
@@ -14,7 +14,7 @@ Keep single-agent execution as the fallback. Parallel execution is an eligibilit
 
 ## 2. Request flow
 
-1. `main.py` or `ui.py` builds a `ToolUseContext`, registers tools, and constructs the system prompt.
+1. `main.py`, Textual `ui.py`, or Chainlit `chainlit_app.py` builds a `ToolUseContext`, registers tools, and constructs the system prompt.
 2. `query.py` maintains the conversation, injects active plan/summary/project memory, applies context shaping, and calls the model through `query_deps.py`.
 3. `api.py` converts messages and tool schemas to the LiteLLM interface, normalizes streaming events, applies provider concurrency and optional RPM/TPM limits, and performs bounded retries/fallbacks.
 4. Model tool calls enter `StreamingToolExecutor` or the serial fallback in `tool_orchestration.py`.
@@ -65,11 +65,15 @@ This workflow sandbox does not change ordinary Bash behavior or grant Bash to Ta
 
 `store.py` keeps an append-only SQLite conversation log, FTS5 search, reversible summary DAG, plans, Task runs/events, artifacts, workflow definitions, and workflow usage. Project artifacts use content hashes. `memory_injector.py` adds bounded plans, summaries, and selected project-memory files to queries; `MemorySearch` and `MemoryExpand` are session-scoped tools. `TodoWrite` state is also mirrored to the store.
 
-## 7. Text UI and permission prompts
+## 7. User interfaces and permission prompts
 
-`ui.py` provides the Textual chat, tool cards, plan panel, activity notices, and Allow/Deny permission screen. Permission requests are serialized so concurrent workers get a visible decision one at a time. The activity status returns from “Waiting for permission” after the last decision. A new Task call still requires a new approval.
+`ui.py` provides the Textual chat, tool cards, plan panel, activity notices, Allow/Deny permission screen, and MCP Connections view. `chainlit_app.py` is a thin browser UI over the same runtime; `chainlit_server.py` exposes its ASGI app. Launch it from `schema manger/` with `uvicorn chainlit_server:app --host 127.0.0.1 --port 8000`. The Chainlit CLI returned static-asset 500s in this environment, while direct Uvicorn served the root, JavaScript, CSS, and favicon successfully.
 
-The focused `test_ui.py` passed after this change. The full offline suite passed before the final UI-only update; rerun it before treating the whole current working tree as fully validated.
+Both UIs use the same permission gate. Textual serializes concurrent permission requests; Chainlit presents action-based Allow/Deny decisions. Chainlit MCP management is in the persistent bottom Settings gear under **MCP Plugin**, not in chat cards or sequential chat questions. It supports add/update/connect/disconnect/remove for stdio and remote Streamable HTTP, OAuth/CIMD, and pre-registered clients. MCP transport contexts are owned by one dedicated task, so entry, tool calls, and exit stay on the same task; offline tests cover the AnyIO failure shape. Codespaces now has GNOME Keyring/Secret Service installed and verified inside an unlocked D-Bus session; launch `chainlit_server:app` inside that session and keep it alive. The callback is `https://${CODESPACE_NAME}-8001.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}/oauth/callback`.
+
+GitHub Copilot's `https://api.githubcopilot.com/mcp/` metadata points to `https://github.com/login/oauth`; GitHub advertises PKCE S256 but no DCR registration endpoint or CIMD support flag. Its DCR fallback returned 404. Use a pre-registered GitHub OAuth App client ID and token auth method in the MCP Plugin form; provide the client secret through an environment variable, not chat or connector JSON. Register the exact public callback URL with the OAuth app. No live GitHub OAuth login has succeeded yet. The earlier Gemini 401 is a separate model-provider credential issue.
+
+`test_mcp_runtime.py`, `test_ui.py`, and `test_imports.py` pass with this state. The full offline suite has known code-intelligence fixture failures in `test_code_index.py` and `test_code_intelligence.py`.
 
 ## 8. Current live evidence
 
@@ -83,7 +87,8 @@ The historical 30-task/90-trial report predates child telemetry and cannot estab
 
 ## 9. Remaining roadmap and next checks
 
-- Rerun the full offline script suite after the latest UI permission change.
+- Exercise a trusted stdio connector through the Textual and Chainlit interfaces. Validate OAuth on a host with an available OS credential-store backend.
+- Investigate environment-sensitive code-intelligence fixtures before treating the full offline suite as green.
 - Review Task budgets and grouping for large-file audits; the screenshot's two failures timed out at about 60 seconds. Do not raise limits blindly; compare per-node complexity, file scope, tool errors, and observed duration.
 - Capture completion of a read-only DAG, including child model IDs, all node outcomes, dependency results, and final synthesis. An integrator that only writes is not appropriate for a read-only audit; use a normal dependent worker.
 - Calibrate the explicit file-writing integrator workflow and approximate token/provider-attempt budgets before broadening code-writing DAGs.
