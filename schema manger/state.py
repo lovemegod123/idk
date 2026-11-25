@@ -99,6 +99,7 @@ class AppState:
 _TASK_ID_PREFIXES = {
     "local_bash": "b",
     "local_agent": "a",
+    "monitor": "m",
     "dream": "d",
 }
 

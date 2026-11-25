@@ -256,6 +256,13 @@ def _has_semantic_exit_code(command: str, code: int) -> bool:
 
 class BashInput(BaseModel):
     command: str = Field(description="The shell command to execute")
+    run_in_background: bool = Field(
+        default=False,
+        description=(
+            "Start this command as a managed background task and return its task ID. "
+            "Use TaskList to inspect it, TaskStop to stop it, and Read on its output file."
+        ),
+    )
     timeout: int | None = Field(
         default=None, gt=0,
         description=(
@@ -303,6 +310,9 @@ def _prompt() -> str:
         "and Read it.\n"
         "- Default timeout is 2 minutes. Pass `timeout` (milliseconds) for "
         "longer operations.\n"
+        "- For long-running work, set `run_in_background=true`. The result "
+        "includes a task ID and private output-file path; use TaskList to inspect, "
+        "TaskStop to stop, and Read to inspect output. The timeout remains enforced.\n"
         "- Chain commands with && when they depend on each other. Use ; only "
         "when you don't care about failure of earlier commands.\n"
         "- Always quote file paths with spaces: `ls \"/path with space\"`.\n"
@@ -334,6 +344,13 @@ def _validate_input(input: BashInput, ctx: ToolUseContext) -> ValidationResult:
                 error_code=2,
             )
 
+    if input.run_in_background and getattr(ctx, "workflow_sandbox_root", None):
+        return ValidationResult(
+            result=False,
+            message="Background commands are not available inside read-only workflows.",
+            error_code=4,
+        )
+
     # Path-safety check on any paths extracted from the command
     # (basic version — full pathValidation.ts is 382 lines)
     if is_destructive_command(cmd):
@@ -360,6 +377,146 @@ def _validate_input(input: BashInput, ctx: ToolUseContext) -> ValidationResult:
 # call — subprocess + timeout + truncation
 # ═════════════════════════════════════════════════════════════════════════
 
+def _auto_background_delay_ms() -> int:
+    raw = os.environ.get("AGENT_BASH_AUTO_BACKGROUND_MS", "15000")
+    try:
+        return max(0, min(int(raw), MAX_TIMEOUT_MS))
+    except ValueError:
+        return 15_000
+
+
+def _auto_background_exempt(command: str) -> bool:
+    parts = split_compound_command(command)
+    return bool(parts and _base_command(parts[0]) == "sleep")
+
+
+async def _managed_foreground_call(
+    input: BashInput,
+    ctx: ToolUseContext,
+    on_progress: Any,
+) -> ToolResult:
+    from background_tasks import get_background_task_manager
+
+    manager = get_background_task_manager(ctx)
+
+    def report_progress(event: dict[str, Any]) -> None:
+        if on_progress is not None:
+            on_progress({
+                "type": "bash_progress",
+                "stream": "stdout",
+                "output": event.get("message", ""),
+            })
+
+    timeout_ms = input.timeout or DEFAULT_TIMEOUT_MS
+    task = await manager.start(
+        input.command,
+        timeout_ms=timeout_ms,
+        description=input.description,
+        owner_agent_id=getattr(ctx, "agent_id", None),
+        background_visible=False,
+        notify_completion=False,
+        on_output=report_progress,
+    )
+    task_id = task["task_id"]
+    wait_task = asyncio.create_task(manager.wait(task_id))
+    foreground_waiters = getattr(ctx, "_foreground_task_waiters", None)
+    if foreground_waiters is None:
+        foreground_waiters = {}
+        ctx._foreground_task_waiters = foreground_waiters
+    foreground_waiters[task_id] = wait_task
+    wait_task.add_done_callback(
+        lambda _finished: foreground_waiters.pop(task_id, None)
+    )
+    abort_controller = getattr(ctx, "abort_controller", None)
+    abort_task = (
+        asyncio.create_task(_wait_for_abort(abort_controller))
+        if abort_controller is not None else None
+    )
+    delay_ms = _auto_background_delay_ms()
+    should_auto_background = (
+        delay_ms > 0
+        and not _auto_background_exempt(input.command)
+        and delay_ms < timeout_ms
+    )
+    background_request = asyncio.Event()
+    ctx._foreground_background_event = background_request
+    ctx._foreground_background_task_id = task_id
+    detached = False
+    try:
+        waiters = [wait_task]
+        if abort_task is not None:
+            waiters.append(abort_task)
+        background_request_task = asyncio.create_task(background_request.wait())
+        waiters.append(background_request_task)
+        done, _ = await asyncio.wait(
+            waiters,
+            timeout=delay_ms / 1000 if should_auto_background else None,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if abort_task is not None and abort_task in done:
+            await manager.stop(task_id, owner_agent_id=getattr(ctx, "agent_id", None))
+            result = await wait_task
+        elif wait_task in done:
+            result = wait_task.result()
+        elif background_request_task in done or should_auto_background:
+            result = manager.promote(task_id)
+            detached = True
+            return ToolResult(data={"background_task": result, "auto_backgrounded": True})
+        else:
+            result = await wait_task
+    except asyncio.CancelledError:
+        await manager.stop(task_id, owner_agent_id=getattr(ctx, "agent_id", None))
+        if not wait_task.done():
+            wait_task.cancel()
+            await asyncio.gather(wait_task, return_exceptions=True)
+        raise
+    finally:
+        ctx._foreground_background_event = None
+        ctx._foreground_background_task_id = None
+        if "background_request_task" in locals():
+            if not background_request_task.done():
+                background_request_task.cancel()
+            await asyncio.gather(background_request_task, return_exceptions=True)
+        if abort_task is not None:
+            if not abort_task.done():
+                abort_task.cancel()
+            await asyncio.gather(abort_task, return_exceptions=True)
+        if not detached and not wait_task.done():
+            wait_task.cancel()
+            await asyncio.gather(wait_task, return_exceptions=True)
+
+    output_path = str(result.get("output_file") or "")
+    output_limit = MAX_OUTPUT_LENGTH
+    output_bytes = int(result.get("output_bytes", 0))
+    truncated = output_bytes > output_limit
+    try:
+        with open(output_path, "rb") as output_file:
+            raw_output = output_file.read(output_limit + 1)
+    except OSError:
+        raw_output = b""
+    stdout = _decode(raw_output)
+    full_output_path = output_path if truncated else None
+    if truncated:
+        stdout = stdout[: output_limit // 2]
+
+    interrupted = result.get("status") in {"timed_out", "cancelled"}
+    exit_code = result.get("exit_code")
+    if exit_code is None:
+        exit_code = -1 if interrupted else 0
+    record = {
+        "command": input.command,
+        "stdout": stdout,
+        "stderr": "",
+        "interrupted": interrupted,
+        "exitCode": exit_code,
+        "interpretation": interpret_exit_code(input.command, exit_code),
+        "truncated": truncated or bool(result.get("output_truncated")),
+        "fullOutputPath": full_output_path,
+        "noOutputExpected": is_silent_command(input.command),
+    }
+    manager.forget(task_id, delete_output=not truncated)
+    return ToolResult(data=record)
+
 async def _call(
     input: BashInput,
     ctx: ToolUseContext,
@@ -371,6 +528,26 @@ async def _call(
     timeout_ms = input.timeout or DEFAULT_TIMEOUT_MS
     timeout_s = timeout_ms / 1000.0
     workflow_sandboxed = bool(getattr(ctx, "workflow_sandbox_root", None))
+
+    if input.run_in_background:
+        from background_tasks import get_background_task_manager
+
+        manager = get_background_task_manager(ctx)
+        task = await manager.start(
+            cmd,
+            timeout_ms=timeout_ms,
+            description=input.description,
+            owner_agent_id=getattr(ctx, "agent_id", None),
+        )
+        return ToolResult(data={"background_task": task})
+
+    has_task_store = bool(
+        getattr(ctx, "_store", None)
+        and getattr(ctx, "session_id", None)
+        and getattr(ctx, "project_root", None)
+    )
+    if not workflow_sandboxed and has_task_store:
+        return await _managed_foreground_call(input, ctx, on_progress)
 
     try:
         if workflow_sandboxed:
@@ -555,6 +732,22 @@ def is_silent_command(command: str) -> bool:
 # ═════════════════════════════════════════════════════════════════════════
 
 def _map_result(data: dict, tool_use_id: str) -> dict:
+    background_task = data.get("background_task")
+    if isinstance(background_task, dict):
+        task_id = background_task.get("task_id", "unknown")
+        output_file = background_task.get("output_file", "")
+        content = (
+            f"Background task `{task_id}` started.\n"
+            f"Output file: `{output_file}`\n"
+            "Use TaskList to check status, TaskStop to stop it, and Read to inspect output."
+        )
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": False,
+        }
+
     stdout = data.get("stdout", "")
     stderr = data.get("stderr", "")
     interrupted = data.get("interrupted", False)
@@ -689,8 +882,14 @@ BashTool = build_tool(
         inp if isinstance(inp, dict) else None
     ),
     # Risk methods — argument-dependent, per source
-    is_read_only=lambda inp: is_read_only_command(getattr(inp, "command", "")),
-    is_concurrency_safe=lambda inp: is_read_only_command(getattr(inp, "command", "")),
+    is_read_only=lambda inp: (
+        not getattr(inp, "run_in_background", False)
+        and is_read_only_command(getattr(inp, "command", ""))
+    ),
+    is_concurrency_safe=lambda inp: (
+        not getattr(inp, "run_in_background", False)
+        and is_read_only_command(getattr(inp, "command", ""))
+    ),
     is_destructive=lambda inp: is_destructive_command(getattr(inp, "command", "")),
     to_auto_classifier_input=lambda inp: getattr(inp, "command", ""),
     get_path=lambda inp: os.getcwd(),

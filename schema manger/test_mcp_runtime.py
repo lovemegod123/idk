@@ -93,6 +93,24 @@ async def main() -> None:
     )
     assert "Dynamic Client Registration" in dcr_error
     assert "client_metadata_url" in dcr_error
+    assert "executable" in mcp_runtime.format_connection_error(FileNotFoundError())
+    assert "timed out" in mcp_runtime.format_connection_error(
+        httpx.ConnectTimeout("connection timed out"),
+    )
+    assert "Could not reach the MCP endpoint" in mcp_runtime.format_connection_error(
+        httpx.ConnectError("connection failed"),
+    )
+    for invalid_headers in (
+        {"oauth": False, "http_headers": {"bad header": "value"}},
+        {"oauth": False, "http_headers": {"Host": "mcp.example.test"}},
+        {"oauth": False, "http_headers": {"X-Mode": "a", "x-mode": "b"}},
+        {"http_headers": {"Authorization": "Bearer token"}},
+    ):
+        try:
+            mcp_runtime._validate_remote_http_headers(invalid_headers)
+            raise AssertionError("invalid or conflicting MCP HTTP headers accepted")
+        except ValueError:
+            pass
 
     assert mcp_runtime._validate_remote_url("https://mcp.example.test/mcp") == "https://mcp.example.test/mcp"
     assert mcp_runtime._validate_remote_url("http://127.0.0.1:8000/mcp") == "http://127.0.0.1:8000/mcp"
@@ -257,6 +275,7 @@ async def main() -> None:
     original_http_client = mcp_runtime.streamable_http_client
     original_client_session = mcp_runtime.ClientSession
     fake_sessions = []
+    captured_http_headers = []
 
     @asynccontextmanager
     async def fake_stdio_client(_params):
@@ -266,6 +285,7 @@ async def main() -> None:
     async def fake_http_client(url, *, http_client):
         assert url == "https://mcp.example.test/mcp"
         assert http_client is not None
+        captured_http_headers.append(dict(http_client.headers))
         yield object(), object(), lambda: None
 
     def fake_client_session(read_stream, write_stream):
@@ -304,6 +324,12 @@ async def main() -> None:
             del os.environ["MCP_TEST_TOKEN"]
 
             remote_config_path = os.path.join(root, "remote-mcp.json")
+            previous_http_env = {
+                name: os.environ.get(name)
+                for name in ("MCP_TEST_BEARER", "MCP_TEST_API_KEY")
+            }
+            os.environ["MCP_TEST_BEARER"] = "test-bearer-secret"
+            os.environ["MCP_TEST_API_KEY"] = "test-api-secret"
             with open(remote_config_path, "w", encoding="utf-8") as target:
                 json.dump({
                     "servers": {
@@ -311,6 +337,9 @@ async def main() -> None:
                             "transport": "streamable_http",
                             "url": "https://mcp.example.test/mcp",
                             "oauth": False,
+                            "http_headers": {"X-Tenant": "test-team"},
+                            "env_http_headers": {"X-API-Key": "MCP_TEST_API_KEY"},
+                            "bearer_token_env_var": "MCP_TEST_BEARER",
                         },
                     },
                 }, target)
@@ -326,7 +355,18 @@ async def main() -> None:
             await remote_manager.connect(["remote"])
             assert remote_manager.connected
             assert "mcp__remote__create_issue" in remote_manager._tools
+            remote_config_text = open(remote_config_path, encoding="utf-8").read()
+            assert "test-bearer-secret" not in remote_config_text
+            assert "test-api-secret" not in remote_config_text
+            assert captured_http_headers[0]["authorization"] == "Bearer test-bearer-secret"
+            assert captured_http_headers[0]["x-api-key"] == "test-api-secret"
+            assert captured_http_headers[0]["x-tenant"] == "test-team"
             await remote_manager.close()
+            for name, value in previous_http_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
             fake_sessions.clear()
             print("✅ Streamable HTTP connects through the existing tool adapter")
 

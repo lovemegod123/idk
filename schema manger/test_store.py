@@ -131,6 +131,20 @@ def main():
         "run_id": "run-1",
         "status": "completed",
     }
+    process_task = {
+        "schema_version": "1.0",
+        "task_id": "b12345678",
+        "type": "local_bash",
+        "status": "running",
+        "output_file": os.path.join(tmp, "output.log"),
+    }
+    store.save_process_task(sid, tmp, process_task)
+    assert store.get_process_task(sid, tmp, "b12345678") == process_task
+    assert store.get_process_task(sid, os.path.join(tmp, "other-project"), "b12345678") is None
+    assert store.list_process_tasks(sid, tmp) == [process_task]
+    store.delete_process_task(sid, tmp, "b12345678")
+    assert store.get_process_task(sid, tmp, "b12345678") is None
+    print("✅ Process handles persist with session/project isolation")
     assert store.get_task_run("run-1", os.path.join(tmp, "other-project")) is None
     assert store.get_task_run("run-1", tmp, "other-session") is None
     assert store.get_task_run("unknown-run", tmp) is None

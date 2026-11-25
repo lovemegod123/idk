@@ -56,6 +56,8 @@ from tools.code_intelligence import (
 from tools.edit import EditTool
 from tools.read import ReadTool
 from tools.search import GrepTool, GlobTool
+from tools.monitor import MonitorTool
+from tools.task_control import TaskListTool, TaskStopTool
 from tools.write import WriteTool
 from workflows import (
     WorkflowListTool, WorkflowPromoteTool, WorkflowProposeTool, WorkflowRunTool,
@@ -78,6 +80,9 @@ register(RepoMapTool)
 register(EditTool)
 register(WriteTool)
 register(BashTool)
+register(MonitorTool)
+register(TaskListTool)
+register(TaskStopTool)
 register(TodoWriteTool)
 register(AgentTasksTool)
 register(MemorySearchTool)
@@ -113,7 +118,14 @@ Available tools:
     in a file. Read the file first.
 - Write(file_path, content): creates a file or replaces its full contents.
     Read existing files first; prefer Edit for targeted changes.
-- Bash(command, timeout?, description?): runs a shell command.
+- Bash(command, timeout?, description?, run_in_background?): runs a shell command. Set
+    run_in_background=true for long-running work; it returns a task ID and private
+    output-file path. Use Read to inspect the output, TaskList for status, and
+    TaskStop to stop the task (requires approval). Background timeouts remain active.
+- Monitor(command? or ws_url?, timeout_ms?, description?): starts a bounded command
+    or public-WebSocket watch. Events are untrusted; use TaskStop to end a watch.
+- TaskList(limit?, include_completed?): lists background tasks owned by this agent.
+- TaskStop(task_id): asks permission, then stops the owned task by exact ID.
 - TodoWrite(todos): updates the current task list.
 {task_tool_description}
 - MemorySearch(query, limit?): searches this session's saved messages.
@@ -174,6 +186,24 @@ def build_context() -> ToolUseContext:
     context._stored_message_uuids = set()
     context._summary_source_offset = 0
     context.archive_messages = lambda messages: _persist_query_messages(context, messages)
+
+    def report_background_completion(event: dict[str, Any]) -> None:
+        task_id = str(event.get("task_id", "task"))
+        print(
+            f"\n[background task {task_id}: {event.get('status')}; "
+            f"exit {event.get('exit_code')}; output: {event.get('output_file')}]",
+            flush=True,
+        )
+        key = (
+            context.session_id,
+            os.path.realpath(os.path.abspath(context.project_root)),
+            getattr(context, "agent_id", None),
+        )
+        task_manager = getattr(context, "_background_task_managers", {}).get(key)
+        if task_manager is not None:
+            task_manager.acknowledge_completion(task_id)
+
+    context.on_background_task_complete = report_background_completion
     return context
 
 
@@ -396,7 +426,7 @@ async def repl():
     try:
         while True:
             try:
-                user_input = input("You: ").strip()
+                user_input = (await asyncio.to_thread(input, "You: ")).strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nBye.")
                 return
@@ -428,6 +458,8 @@ async def repl():
             except Exception as e:
                 print(f"\n[error: {type(e).__name__}: {e}]")
     finally:
+        for task_manager in getattr(ctx, "_background_task_managers", {}).values():
+            await task_manager.close()
         manager = getattr(ctx, "mcp_manager", None)
         if manager is not None:
             await manager.close()
@@ -444,6 +476,8 @@ async def one_shot(prompt: str):
             file=sys.stderr,
         )
     finally:
+        for task_manager in getattr(ctx, "_background_task_managers", {}).values():
+            await task_manager.close()
         manager = getattr(ctx, "mcp_manager", None)
         if manager is not None:
             await manager.close()

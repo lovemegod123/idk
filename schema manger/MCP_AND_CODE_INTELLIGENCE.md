@@ -45,6 +45,29 @@ Remote servers use Streamable HTTP and OAuth by default:
 }
 ```
 
+For servers using API keys or static Bearer tokens, keep secrets in the process environment:
+
+```json
+{
+  "servers": {
+    "tracker-cloud": {
+      "transport": "streamable_http",
+      "url": "https://mcp.example.com/mcp",
+      "oauth": false,
+      "bearer_token_env_var": "TRACKER_TOKEN",
+      "env_http_headers": {
+        "X-API-Key": "TRACKER_API_KEY"
+      },
+      "http_headers": {
+        "X-Tenant": "team-a"
+      }
+    }
+  }
+}
+```
+
+`bearer_token_env_var` adds an `Authorization: Bearer` header. `env_http_headers` maps header names to environment-variable names; values are resolved only when connecting and are never saved in connector JSON. `http_headers` is for non-secret fixed values. An `Authorization` header cannot be combined with OAuth. Missing or invalid environment values fail closed.
+
 Without `client_metadata_url`, the OAuth SDK uses its registration compatibility path. CIMD is preferred by the current MCP authorization specification; its public metadata document must declare the exact configured redirect URI. If `redirect_uri` is omitted, the client uses an ephemeral loopback port, which is suitable for local dynamic registration. Set `"oauth": false` only for an intentionally unauthenticated remote server. The first authorization opens the system browser in the Textual UI or posts a sign-in link in Chainlit; tokens and client registration data are stored in the OS credential store through `keyring`. OAuth fails closed if no usable credential-store backend is available.
 
 For Chainlit behind a remote browser (for example, Codespaces), configure the public HTTPS callback URL with `AGENT_MCP_OAUTH_REDIRECT_URI=https://<forwarded-host>/oauth/callback`, or set `oauth.redirect_uri` on an individual server. The callback host must route to the Chainlit server on port 8000. Chainlit posts the provider authorization link in the chat, and its `/oauth/callback` route delivers the redirect to the pending connection after validating OAuth state. CIMD metadata must list this exact public redirect URI; dynamic registration must allow it. Servers that disable DCR may instead use `oauth.client_id` with optional `oauth.client_secret_env` and `oauth.token_endpoint_auth_method`; the referenced secret is loaded from the process environment and pre-registered client info is stored in the OS keyring. Keep the app private and use a host with an available OS credential store. Without this setting, the existing loopback callback remains in use.
@@ -66,6 +89,8 @@ For stdio servers, only a small allowlist of non-secret process environment valu
 - `AstGrep` uses a pinned local CLI and is read-only. Pattern search is bounded to explicitly enumerated files; rewriting is not exposed.
 - Pyright references/definitions run on demand over one project root or a Task-scope snapshot. Multi-root/worktree correctness, diagnostics, rename, and cache reuse are not implemented yet.
 - Connecting a stdio server starts a configured subprocess as the current OS user; remote servers are contacted over Streamable HTTP. Per-tool permission prompts are not an OS sandbox or a server trust guarantee; select and configure trusted servers.
+- The manager intentionally supports stdio and Streamable HTTP, not legacy SSE or client-specific WebSocket transports. Claude Code documents stdio, HTTP, SSE, and WebSocket; Codex documents stdio and Streamable HTTP. See [Claude Code MCP](https://docs.anthropic.com/en/docs/claude-code/mcp) and [Codex MCP](https://developers.openai.com/codex/mcp/).
+- This checkout pins the MCP Python SDK to `>=1.30,<2`; the installed LangChain MCP adapter also requires `mcp<2`. The current client therefore uses the legacy initialize/session protocol and does not claim support for the stateless `2026-07-28` protocol generation. That revision removes HTTP protocol sessions and initialization for modern clients, changes request metadata, and deprecates DCR in favor of CIMD; see the [2026-07-28 specification changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog). Upgrade the MCP SDK and adapter together, then validate dual-era interoperability and OAuth before enabling it.
 - Server tool schemas are checked locally, remote `$ref` resolution is rejected, and schemas/results are bounded. Descriptor hashes are recorded for diagnostics but there is not yet a persistent approval manifest or `tools/list_changed` refresh flow.
 - Tool discovery uses bounded local keyword matching, not BM25 or a third-party gateway. Only selected schemas are sent to the model.
 - MCP resources, prompts, sampling, subscriptions, and MCP Apps are not integrated. Remote OAuth currently uses the system browser; persistent per-tool approval grants and provider-side OAuth revocation are not implemented.

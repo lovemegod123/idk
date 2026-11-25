@@ -4,28 +4,83 @@ import os
 
 os.environ["AGENT_STORE_PATH"] = ":memory:"
 
-from textual.widgets import Button, Header, Input, Select
+from textual.containers import VerticalScroll
+from textual.widgets import Button, Input, OptionList, Select
 
 import ui
 from main import _persist_query_messages
 from messages import ProgressMessage, ToolResultMessage
+from permission_types import OtherReason
 from registry import find
 from query_transitions import Terminal
 from ui import (
-    AgentApp, PermissionScreen, PlanPanel, StatusBar, StreamingMarkdown,
-    SystemNotice, ToolCard, UserMessage,
+    AgentApp, AssistantBlock, Composer, McpActionButton, PermissionScreen,
+    PlanPanel, StatusBar, StreamingMarkdown, SystemNotice, ToolCard, UserMessage,
+    build_server_config, convert_server_spec, parse_mcp_json, validate_env_name,
+    validate_remote_url, validate_server_name,
 )
 
 
 async def main():
+    assert validate_server_name("github") == "github"
+    assert validate_env_name("DOCS_API_KEY", "Bearer token variable") == "DOCS_API_KEY"
+    for invalid_env in ("token-value", "ghp_example", "has spaces"):
+        try:
+            validate_env_name(invalid_env, "Bearer token variable")
+            raise AssertionError("literal or malformed secret was accepted")
+        except ValueError:
+            pass
+    assert validate_remote_url("https://mcp.example.test/mcp") == "https://mcp.example.test/mcp"
+    try:
+        validate_remote_url("https://mcp.example.test/sse")
+        raise AssertionError("legacy SSE endpoint was accepted")
+    except ValueError as error:
+        assert "Streamable HTTP" in str(error)
+    form_config = build_server_config(
+        transport="streamable_http",
+        endpoint="https://mcp.example.test/mcp",
+        oauth=False,
+        bearer_env="DOCS_API_KEY",
+        env_headers_json='{"X-API-Key":"DOCS_API_KEY"}',
+    )
+    assert form_config["bearer_token_env_var"] == "DOCS_API_KEY"
+    assert form_config["env_http_headers"] == {"X-API-Key": "DOCS_API_KEY"}
+    imported = parse_mcp_json(
+        '{"mcpServers":{"docs":{"type":"http","url":"https://mcp.example.test/mcp",'
+        '"headers":{"Authorization":"Bearer ${DOCS_API_KEY}","X-Tenant":"team"}}}}',
+    )
+    assert imported[0][1]["bearer_token_env_var"] == "DOCS_API_KEY"
+    assert imported[0][1]["http_headers"] == {"X-Tenant": "team"}
+    assert convert_server_spec("local", {
+        "type": "stdio", "command": ["uvx", "trusted-mcp"], "env": {"TOKEN": "${TOKEN}"},
+    })["args"] == ["trusted-mcp"]
+
     app = AgentApp()
     async with app.run_test(size=(110, 32)) as pilot:
-        assert app.query_one(Header)
-        composer = app.query_one("#composer", Input)
+        assert app.query_one("#topbar")
+        composer = app.query_one("#composer", Composer)
         assert app.query_one(StatusBar)
         assert app.query_one(PlanPanel)
         assert app.query_one("#activity-view")
         assert app.query_one("#runtime-view")
+        assert app.query_one("#session-list", OptionList)
+        await pilot.press("h", "i")
+        assert composer.text == "hi"
+        await pilot.press("ctrl+j")
+        assert composer.text == "hi\n"
+        composer.set_value("")
+        composer.remember("previous command")
+        composer.set_value("draft text")
+        await pilot.press("up")
+        assert composer.text == "previous command"
+        await pilot.press("down")
+        assert composer.text == "draft text"
+        composer.set_value("/he")
+        await pilot.pause()
+        assert "/help" in composer.completions
+        await pilot.press("tab")
+        assert composer.text == "/help "
+        composer.set_value("")
         assert find("Read") is not None
         assert find("Write") is not None
         assert find("Bash") is not None
@@ -46,13 +101,16 @@ async def main():
         )
         app.ctx._store.append_message("ui-other-session", "user", "Another task")
         await app._refresh_sessions("older task")
-        assert len(app._session_buttons) == 1
+        sessions = app.query_one("#session-list", OptionList)
+        assert sessions.option_count == 1
+        assert sessions.get_option_at_index(0).id == restored_id
         await app._select_session(restored_id)
         assert app.ctx.session_id == restored_id
         assert any(
             isinstance(markdown, StreamingMarkdown)
             and markdown._buffer.startswith("**I will inspect")
-            for markdown in app.query_one("#transcript").query(StreamingMarkdown)
+            for block in app.query_one("#transcript").query(AssistantBlock)
+            for markdown in block.query(StreamingMarkdown)
         )
         restored_messages = app.ctx.get_app_state().messages
         restored_calls = [
@@ -92,31 +150,38 @@ async def main():
         assert app.ctx.session_id != restored_id
         assert app.ctx.get_app_state().messages == []
         assert app.ctx._store.count_messages(restored_id) == 4
-        app.action_show_tools()
-        assert app._active_view == "tools"
-        assert app.query_one("#tools-view").display
-        app.action_show_activity()
-        assert app._active_view == "activity"
-        assert app.query_one("#activity-view").display
-        assert not app.query_one("#transcript").display
-        app.action_show_settings()
-        assert app._active_view == "settings"
-        assert app.query_one("#runtime-view").display
-        assert not app.query_one("#composer").display
-        await app.action_show_connections()
-        assert app._active_view == "connections"
-        assert app.query_one("#connections-view").display
+        app._show_view("tools-view")
+        assert app._active_view == "tools-view"
+        assert app.query_one("#views").current == "tools-view"
+        app._show_view("activity-view")
+        assert app._active_view == "activity-view"
+        assert app.query_one("#views").current == "activity-view"
+        app._show_view("runtime-view")
+        assert app._active_view == "runtime-view"
+        assert app.query_one("#views").current == "runtime-view"
+        assert app.query_one("#composer").display
+        app._show_view("mcp-view")
+        assert app._active_view == "mcp-view"
+        assert app.query_one("#views").current == "mcp-view"
         assert app.query_one("#mcp-transport", Select).value == "stdio"
-        assert app.query_one("#mcp-args", Input).display
-        assert not app.query_one("#mcp-oauth").display
-        app.on_mcp_transport_changed(type("Selection", (), {"value": "streamable_http"})())
-        assert not app.query_one("#mcp-args", Input).display
-        assert app.query_one("#mcp-oauth").display
+        assert app.query_one("#mcp-stdio-fields").display
+        assert not app.query_one("#mcp-remote-fields").display
+        app.query_one("#mcp-transport", Select).value = "streamable_http"
+        app._apply_transport_visibility("streamable_http")
+        assert not app.query_one("#mcp-stdio-fields").display
+        assert app.query_one("#mcp-remote-fields").display
+        assert app.query_one("#mcp-oauth-fields").display
+        app._apply_oauth_visibility(False)
+        assert app.query_one("#mcp-bearer-fields").display
+        assert not app.query_one("#mcp-oauth-fields").display
+        app.query_one("#mcp-transport", Select).value = "stdio"
+        app._apply_transport_visibility("stdio")
 
         class FakeMCPManager:
             def __init__(self):
-                self._connections = {"calendar": type("Connection", (), {"tool_names": ["list_events"]})()}
-                self.config_path = type("ConfigPath", (), {"is_file": lambda _self: False})()
+                self._connections = {
+                    "calendar": type("Connection", (), {"tool_names": ["list_events"]})(),
+                }
                 self.connected_names = []
                 self.servers = {
                     "calendar": {
@@ -144,6 +209,9 @@ async def main():
             async def disconnect_server(self, name):
                 self._connections.pop(name, None)
 
+            def remove_server_config(self, name):
+                self.servers.pop(name, None)
+
             async def close(self):
                 return None
 
@@ -152,23 +220,14 @@ async def main():
         await app._refresh_mcp_connections()
         await pilot.pause()
         assert len(app.query_one("#mcp-servers-list").query(".mcp-server-row")) == 2
-        assert sum(
-            target[0] == "disconnect" for target in app._mcp_action_targets.values()
-        ) == 1
-        assert sum(
-            target[0] == "connect" for target in app._mcp_action_targets.values()
-        ) == 1
         async def allow_connection(*_args):
             return True
 
         app._confirm_mcp_connection = allow_connection
-        connect_button = app.query_one("#mcp-connect-1", Button)
-        await app.on_mcp_connect_button(Button.Pressed(connect_button))
+        await app._mcp_action("connect", "tracker")
         assert app.ctx.mcp_manager.connected_names == ["tracker"]
         assert "tracker" in app.ctx.mcp_manager._connections
-        await pilot.pause()
-        disconnect_button = app.query_one("#mcp-connect-1", Button)
-        await app.on_mcp_connect_button(Button.Pressed(disconnect_button))
+        await app._mcp_action("disconnect", "tracker")
         assert "tracker" not in app.ctx.mcp_manager._connections
 
         app.query_one("#mcp-name", Input).value = "local-test"
@@ -180,9 +239,9 @@ async def main():
         ]
         assert "local-test" in app.ctx.mcp_manager.connected_names
         app.ctx.mcp_manager = original_mcp_manager
-        app.action_show_current()
-        assert app._active_view == "current"
-        assert app.query_one("#transcript").display
+        app._show_view("transcript")
+        assert app._active_view == "transcript"
+        assert app.query_one("#views").current == "transcript"
         assert app.query_one("#composer").display
         print("✅ New session and tool catalog views work")
 
@@ -193,10 +252,10 @@ async def main():
         streaming.finish()
         await pilot.pause()
         assert streaming._buffer == "assistant response"
-        composer.value = "/tools"
+        composer.set_value("/tools")
         await pilot.press("enter")
         await pilot.pause()
-        assert any("Write" in notice._text for notice in app.query(SystemNotice))
+        assert app._active_view == "tools-view"
 
         card = ToolCard("tool-1", "Bash", "echo test")
         app._tool_cards["tool-1"] = card
@@ -207,7 +266,7 @@ async def main():
             parent_tool_use_id="",
             data={"type": "bash_progress", "output": "still running"},
         ))
-        assert card._progress_lines == ["still running"]
+        assert card._tc_progress == ["still running"]
         await app._dispatch_event(ProgressMessage(
             tool_use_id="task-tool",
             parent_tool_use_id="",
@@ -216,21 +275,21 @@ async def main():
                 "status": "succeeded", "needs": [], "duration_ms": 12,
             },
         ))
-        assert any("Task inspect: succeeded" in notice._text
+        assert any("Task inspect: succeeded" in notice.message
                    for notice in app.query(SystemNotice))
         assert any(
-            "Task inspect: succeeded" in notice._text
+            "Task inspect: succeeded" in notice.message
             for notice in app.query_one("#activity-view").query(SystemNotice)
         )
         activity_session_id = app.ctx.session_id
         assert app._activity_entries[activity_session_id]
-        await app.action_new_session()
-        assert not app.query_one("#activity-view").query(SystemNotice)
-        assert app._activity_entries[activity_session_id]
         await app._dispatch_event(ToolResultMessage(
             tool_use_id="tool-1", content="done", is_error=False,
         ))
-        assert "DONE" in card.title
+        assert card._tc_state == "done"
+        await app.action_new_session()
+        assert not app.query_one("#activity-view").query(SystemNotice)
+        assert app._activity_entries[activity_session_id]
 
         app.ctx._store.save_plan(app.ctx.session_id, "UI test", [
             {"content": "verify rendering", "status": "in_progress"},
@@ -243,7 +302,7 @@ async def main():
             "status": "injected", "source": "project_files", "count": 1,
             "names": ["Deployment Guide"],
         })
-        assert any("Memory context injected" in notice._text
+        assert any("Memory context injected" in notice.message
                    for notice in app.query(SystemNotice))
         await app._dispatch_event(ProgressMessage(
             tool_use_id="todo-tool",
@@ -254,29 +313,29 @@ async def main():
                 "in_progress_count": 1, "cleared": False,
             },
         ))
-        assert any("Plan updated: 3 items" in notice._text
+        assert any("Plan updated: 3 items" in notice.message
                    for notice in app.query(SystemNotice))
         await app._dispatch_event({
             "type": "runtime_activity", "area": "provider",
             "status": "fallback", "model": "nvidia_nim/model-a",
             "alternate_model": "groq/model-b", "category": "provider_overloaded",
         })
-        assert any("Provider fallback" in notice._text
+        assert any("Provider fallback" in notice.message
                    for notice in app.query(SystemNotice))
 
         app._turn_had_visible_output = False
-        await app._dispatch_event(ui.create_assistant_message(tool_calls=[
-            ui.ToolUseBlock(id="tool-only", name="Read", input={"file_path": "src.py"}),
-        ]))
         await app._dispatch_event(Terminal(reason="completed"))
         assert any(
-            "completed without a visible response" in notice._text
+            "completed without a visible response" in notice.message
             for notice in app.query(SystemNotice)
         )
 
         first_permission = app.run_worker(
             app._can_use_tool(
-                type("Decision", (), {"message": "Allow the first worker?"})(),
+                type("Decision", (), {
+                    "message": "Allow the first worker?",
+                    "updated_input": {"command": "git status"},
+                })(),
             ),
             group="permission-test",
             exclusive=False,
@@ -285,6 +344,9 @@ async def main():
         assert isinstance(app.screen, PermissionScreen)
         app.screen.query_one("#allow", Button)
         app.screen.query_one("#deny", Button)
+        app.screen.query_one("#permission-scroll", VerticalScroll)
+        assert "Arguments to review" in app.screen._perm_message
+        assert "git status" in app.screen._perm_message
         second_permission = app.run_worker(
             app._can_use_tool(
                 type("Decision", (), {"message": "Allow the second worker?"})(),
@@ -305,6 +367,28 @@ async def main():
         await pilot.pause()
         assert app.query_one(StatusBar).activity == "Ready"
 
+        app._set_auto_approve(True)
+        app._always_allow.add("mcp__test__search")
+        mcp_permission = app.run_worker(
+            app._can_use_tool(type("Decision", (), {
+                "message": "Call the external MCP tool?",
+                "updated_input": {"query": "status"},
+                "metadata": {"tool_name": "mcp__test__search"},
+                "decision_reason": OtherReason(reason="external_mcp_tool"),
+            })()),
+            group="permission-test",
+            exclusive=False,
+        )
+        await pilot.pause()
+        assert isinstance(app.screen, PermissionScreen)
+        assert not app.screen._perm_always
+        await pilot.press("y")
+        assert await mcp_permission.wait() is True
+        app._set_auto_approve(False)
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app.is_running
         await pilot.press("ctrl+c")
         await pilot.pause()
         assert not app.is_running
@@ -328,10 +412,10 @@ async def main():
         async with app.run_test(size=(80, 24)) as pilot:
             app._start_turn("close the interface")
             await asyncio.wait_for(query_started.wait(), timeout=1)
-            await pilot.press("ctrl+c")
+            await pilot.press("escape")
             await pilot.pause(0.1)
             assert query_closed.is_set()
-            assert not app.is_running
+            assert app.is_running
     finally:
         ui.query = original_query
 
@@ -353,7 +437,15 @@ async def main():
         async with app.run_test(size=(80, 24)) as pilot:
             original_session_id = app.ctx.session_id
             app._start_turn("hey")
+            app._submit_text("queued follow-up")
+            assert app._ui_queue == ["queued follow-up"]
             await app._worker.wait()
+            await pilot.pause(0.1)
+            assert not app._ui_queue
+            assert sum(
+                getattr(message, "type", None) == "user"
+                for message in app.ctx.get_app_state().messages
+            ) == 2
             assert any(
                 getattr(message, "content", None) == "The reply should survive a session switch."
                 for message in app.ctx.get_app_state().messages
@@ -367,10 +459,11 @@ async def main():
             assert any(
                 isinstance(markdown, StreamingMarkdown)
                 and markdown._buffer == "The reply should survive a session switch."
-                for markdown in app.query_one("#transcript").query(StreamingMarkdown)
+                for block in app.query_one("#transcript").query(AssistantBlock)
+                for markdown in block.query(StreamingMarkdown)
             )
             assert any(
-                isinstance(card, ToolCard) and "DONE" in card.title
+                isinstance(card, ToolCard) and card._tc_state == "done"
                 for card in app.query_one("#transcript").query(ToolCard)
             )
     finally:

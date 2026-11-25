@@ -88,6 +88,18 @@ CREATE TABLE IF NOT EXISTS task_runs (
 CREATE INDEX IF NOT EXISTS idx_task_runs_project
     ON task_runs(project_root, updated_at);
 
+CREATE TABLE IF NOT EXISTS process_tasks (
+    session_id   TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    task_id      TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (session_id, project_root, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_process_tasks_session
+    ON process_tasks(session_id, project_root, updated_at);
+
 CREATE TABLE IF NOT EXISTS task_idempotency (
     session_id       TEXT NOT NULL,
     project_root     TEXT NOT NULL,
@@ -810,6 +822,83 @@ class Store:
         if payload.get("schema_version") != "1.0" or payload.get("run_id") != run_id:
             return None
         return payload
+
+    def save_process_task(
+        self,
+        session_id: str,
+        project_root: str,
+        task: dict,
+    ) -> None:
+        """Persist a process handle without storing its command or raw output."""
+        if not session_id or not isinstance(task, dict):
+            raise ValueError("Process tasks require a session and record")
+        if task.get("schema_version") != "1.0":
+            raise ValueError("Unsupported process task schema version")
+        task_id = task.get("task_id")
+        status = task.get("status")
+        if not isinstance(task_id, str) or not task_id or len(task_id) > 64:
+            raise ValueError("Process task ID must contain 1-64 characters")
+        if status not in {
+            "queued", "running", "completed", "failed", "timed_out",
+            "cancelled", "orphaned",
+        }:
+            raise ValueError("Process task has an invalid status")
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        payload = json.dumps(task, ensure_ascii=True, sort_keys=True)
+        with self.db:
+            self.db.execute(
+                "INSERT INTO process_tasks "
+                "(session_id, project_root, task_id, status, payload, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id, project_root, task_id) DO UPDATE SET "
+                "status = excluded.status, payload = excluded.payload, "
+                "updated_at = excluded.updated_at",
+                (session_id, canonical_root, task_id, status, payload, time.time()),
+            )
+
+    def get_process_task(
+        self,
+        session_id: str,
+        project_root: str,
+        task_id: str,
+    ) -> dict | None:
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        row = self.db.execute(
+            "SELECT payload FROM process_tasks "
+            "WHERE session_id = ? AND project_root = ? AND task_id = ?",
+            (session_id, canonical_root, task_id),
+        ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_process_tasks(
+        self,
+        session_id: str,
+        project_root: str,
+        limit: int = 100,
+    ) -> list[dict]:
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        bounded_limit = max(1, min(int(limit), 500))
+        rows = self.db.execute(
+            "SELECT payload FROM process_tasks "
+            "WHERE session_id = ? AND project_root = ? "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (session_id, canonical_root, bounded_limit),
+        ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def delete_process_task(
+        self,
+        session_id: str,
+        project_root: str,
+        task_id: str,
+    ) -> None:
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        with self.db:
+            self.db.execute(
+                "DELETE FROM process_tasks "
+                "WHERE session_id = ? AND project_root = ? AND task_id = ?",
+                (session_id, canonical_root, task_id),
+            )
 
     # ── View assembly (the "projection") ───────────────────────────────
 

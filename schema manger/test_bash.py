@@ -12,6 +12,7 @@ from tools.bash import (
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MAX_OUTPUT_LENGTH,
 )
 from state import AppState, FileStateCache, ToolPermissionContext
+from store import Store
 from tool import ToolUseContext
 
 
@@ -94,6 +95,95 @@ async def main():
     assert not res.is_error, res.result_message.content
     assert "hello" in res.result_message.content
     print("✅ Simple echo OK")
+
+    # ═══ 5b. Background process handle + Read-compatible output file ═══
+    with tempfile.TemporaryDirectory() as task_root:
+        ctx = make_ctx()
+        ctx.project_root = task_root
+        ctx.session_id = "background-bash-test"
+        ctx._store = Store(os.path.join(task_root, "agent.db"))
+        res = await _bash(
+            ctx,
+            "printf 'detached output\\n'",
+            run_in_background=True,
+            description="background integration test",
+        )
+        assert not res.is_error, res.result_message.content
+        manager = ctx._background_task_manager
+        task = manager.list_tasks()[0]
+        completed = await manager.wait(task["task_id"])
+        assert completed["status"] == "completed", completed
+        assert completed["output_file"] in res.result_message.content
+        with open(completed["output_file"], encoding="utf-8") as output:
+            assert output.read() == "detached output\n"
+        await manager.close()
+        ctx._store.close()
+    print("✅ Background Bash returns a task handle and Read-compatible output")
+
+    # ═══ 5c. Foreground command auto-promotes after configured grace ═══
+    with tempfile.TemporaryDirectory() as task_root:
+        previous_delay = os.environ.get("AGENT_BASH_AUTO_BACKGROUND_MS")
+        os.environ["AGENT_BASH_AUTO_BACKGROUND_MS"] = "50"
+        ctx = make_ctx()
+        ctx.project_root = task_root
+        ctx.session_id = "auto-background-test"
+        ctx._store = Store(os.path.join(task_root, "agent.db"))
+        try:
+            res = await _bash(
+                ctx,
+                "python -c \"import time; time.sleep(0.25); print('promoted')\"",
+                timeout=1_000,
+            )
+            assert not res.is_error, res.result_message.content
+            assert "Background task" in res.result_message.content
+            task = ctx._background_task_manager.list_tasks()[0]
+            completed = await ctx._background_task_manager.wait(task["task_id"])
+            assert completed["status"] == "completed", completed
+            with open(completed["output_file"], encoding="utf-8") as output:
+                assert "promoted" in output.read()
+            await ctx._background_task_manager.close()
+        finally:
+            ctx._store.close()
+            if previous_delay is None:
+                os.environ.pop("AGENT_BASH_AUTO_BACKGROUND_MS", None)
+            else:
+                os.environ["AGENT_BASH_AUTO_BACKGROUND_MS"] = previous_delay
+    print("✅ Long foreground Bash auto-promotes without changing its hard timeout")
+
+    # ═══ 5d. Manual promotion request detaches the active foreground command ═══
+    with tempfile.TemporaryDirectory() as task_root:
+        previous_delay = os.environ.get("AGENT_BASH_AUTO_BACKGROUND_MS")
+        os.environ["AGENT_BASH_AUTO_BACKGROUND_MS"] = "0"
+        ctx = make_ctx()
+        ctx.project_root = task_root
+        ctx.session_id = "manual-background-test"
+        ctx._store = Store(os.path.join(task_root, "agent.db"))
+        try:
+            foreground = asyncio.create_task(_bash(
+                ctx,
+                "python -c \"import time; time.sleep(0.25); print('manual')\"",
+                timeout=1_000,
+            ))
+            for _ in range(200):
+                if getattr(ctx, "_foreground_background_event", None) is not None:
+                    break
+                await asyncio.sleep(0)
+            assert ctx._foreground_background_event is not None
+            ctx._foreground_background_event.set()
+            res = await asyncio.wait_for(foreground, timeout=1)
+            assert not res.is_error, res.result_message.content
+            assert "Background task" in res.result_message.content
+            task = ctx._background_task_manager.list_tasks()[0]
+            completed = await ctx._background_task_manager.wait(task["task_id"])
+            assert completed["status"] == "completed", completed
+            await ctx._background_task_manager.close()
+        finally:
+            ctx._store.close()
+            if previous_delay is None:
+                os.environ.pop("AGENT_BASH_AUTO_BACKGROUND_MS", None)
+            else:
+                os.environ["AGENT_BASH_AUTO_BACKGROUND_MS"] = previous_delay
+    print("✅ Manual background request detaches the foreground command")
 
     # ═══ 6. Nonzero exit that's NOT an error (grep no matches) ═══
     tmp = tempfile.mkdtemp()

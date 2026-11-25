@@ -1,4 +1,4 @@
-"""User-configured, stdio-only MCP client with lazy tool activation."""
+"""User-configured MCP client with lazy tool activation."""
 from __future__ import annotations
 
 import asyncio
@@ -43,6 +43,11 @@ MCP_CALL_TIMEOUT_SECONDS = 60
 OAUTH_CALLBACK_TIMEOUT_SECONDS = 300
 SERVER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 TOOL_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
+ENV_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+HTTP_HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+FORBIDDEN_HTTP_HEADERS = frozenset({
+    "connection", "content-length", "host", "transfer-encoding",
+})
 SAFE_SERVER_ENV = (
     "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL",
     "VIRTUAL_ENV", "SYSTEMROOT",
@@ -76,6 +81,76 @@ def _validate_remote_url(value: Any) -> str:
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("Remote MCP URL has an invalid port")
     return value
+
+
+def _validate_remote_http_headers(config: dict[str, Any]) -> None:
+    static_headers = config.get("http_headers", {})
+    env_headers = config.get("env_http_headers", {})
+    bearer_env = config.get("bearer_token_env_var")
+    if not isinstance(static_headers, dict) or not isinstance(env_headers, dict):
+        raise ValueError("MCP HTTP headers must be objects")
+    if bearer_env is not None and (
+        not isinstance(bearer_env, str) or not ENV_NAME_PATTERN.fullmatch(bearer_env)
+    ):
+        raise ValueError("bearer_token_env_var must be an environment variable name")
+
+    names: set[str] = set()
+    for header_name, value in static_headers.items():
+        if (
+            not isinstance(header_name, str)
+            or not HTTP_HEADER_NAME_PATTERN.fullmatch(header_name)
+            or header_name.casefold() in FORBIDDEN_HTTP_HEADERS
+        ):
+            raise ValueError("MCP HTTP header name is invalid or managed by the client")
+        if not isinstance(value, str) or "\r" in value or "\n" in value:
+            raise ValueError("MCP HTTP header values must be single-line strings")
+        folded_name = header_name.casefold()
+        if folded_name in names:
+            raise ValueError(f"Duplicate MCP HTTP header: {header_name}")
+        names.add(folded_name)
+
+    for header_name, env_name in env_headers.items():
+        if (
+            not isinstance(header_name, str)
+            or not HTTP_HEADER_NAME_PATTERN.fullmatch(header_name)
+            or header_name.casefold() in FORBIDDEN_HTTP_HEADERS
+        ):
+            raise ValueError("MCP HTTP header name is invalid or managed by the client")
+        if not isinstance(env_name, str) or not ENV_NAME_PATTERN.fullmatch(env_name):
+            raise ValueError("env_http_headers values must be environment variable names")
+        folded_name = header_name.casefold()
+        if folded_name in names:
+            raise ValueError(f"Duplicate MCP HTTP header: {header_name}")
+        names.add(folded_name)
+
+    if bearer_env is not None:
+        if "authorization" in names:
+            raise ValueError("Configure Bearer authorization only once")
+        names.add("authorization")
+
+    if (
+        config.get("oauth", {}) is not False
+        and "authorization" in names
+    ):
+        raise ValueError("Use either OAuth or an Authorization header, not both")
+
+
+def _resolve_remote_http_headers(config: dict[str, Any]) -> dict[str, str]:
+    _validate_remote_http_headers(config)
+    headers = dict(config.get("http_headers", {}))
+    for header_name, env_name in config.get("env_http_headers", {}).items():
+        value = os.environ.get(env_name)
+        if not value or "\r" in value or "\n" in value:
+            raise ValueError(f"MCP HTTP header environment variable {env_name!r} is unset or invalid")
+        headers[header_name] = value
+
+    bearer_env = config.get("bearer_token_env_var")
+    if bearer_env is not None:
+        token = os.environ.get(bearer_env)
+        if not token or "\r" in token or "\n" in token:
+            raise ValueError(f"MCP Bearer token environment variable {bearer_env!r} is unset or invalid")
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def _validate_redirect_uri(value: Any) -> tuple[str | None, int | None, str]:
@@ -139,6 +214,14 @@ def format_connection_error(error: BaseException) -> str:
         )
     if message.startswith("OAuth requires ") or isinstance(error, ValueError):
         return message
+    if isinstance(error, FileNotFoundError):
+        return "MCP server executable or configured file was not found. Check the command and working directory."
+    if isinstance(error, PermissionError):
+        return "The MCP server could not be started or accessed due to operating-system permissions."
+    if isinstance(error, (TimeoutError, httpx.TimeoutException)):
+        return "MCP connection timed out. Check that the server is running and the endpoint is reachable."
+    if isinstance(error, httpx.ConnectError):
+        return "Could not reach the MCP endpoint. Check its URL, DNS, TLS, and network availability."
     return f"{type(error).__name__}. Check the server endpoint and authentication setup."
 
 
@@ -472,6 +555,7 @@ class MCPManager:
             oauth = server_config.get("oauth", {})
             if oauth is not False and not isinstance(oauth, dict):
                 raise ValueError("MCP oauth configuration must be an object or false")
+            _validate_remote_http_headers(server_config)
             if isinstance(oauth, dict):
                 metadata_url = oauth.get("client_metadata_url")
                 if metadata_url is not None:
@@ -803,6 +887,7 @@ class MCPManager:
         oauth_config = server_config.get("oauth", {})
         if oauth_config is not False and not isinstance(oauth_config, dict):
             raise ValueError(f"MCP server {server_name!r} oauth config must be an object or false")
+        headers = _resolve_remote_http_headers(server_config)
 
         auth_provider = None
         if oauth_config is not False:
@@ -884,7 +969,11 @@ class MCPManager:
             )
             provider_ref["provider"] = auth_provider
 
-        client = httpx.AsyncClient(auth=auth_provider, follow_redirects=False)
+        client = httpx.AsyncClient(
+            auth=auth_provider,
+            headers=headers,
+            follow_redirects=False,
+        )
         await stack.enter_async_context(client)
         read_stream, write_stream, _get_session_id = await stack.enter_async_context(
             streamable_http_client(url, http_client=client),

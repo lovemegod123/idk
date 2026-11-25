@@ -357,6 +357,10 @@ async def _ask_human(
     """Ask for approval. can_use_tool → request_prompt → input()."""
     if can_use_tool is not None and callable(can_use_tool):
         try:
+            decision.metadata = {
+                **(decision.metadata or {}),
+                "tool_name": tool_name,
+            }
             return bool(await can_use_tool(decision))
         except Exception as e:
             logger.error("can_use_tool raised: %s", e)
