@@ -44,7 +44,8 @@ def main():
     def cli_tools_registered():
         from registry import find
         expected = (
-            "Read", "Edit", "Write", "Bash", "TodoWrite", "Task",
+            "Read", "Edit", "Write", "Bash", "Monitor", "TaskList",
+            "TaskStop", "TaskForget", "TodoWrite", "Task",
             "MemorySearch", "MemoryExpand", "WorkflowPropose", "WorkflowRun",
             "WorkflowList", "WorkflowPromote",
         )

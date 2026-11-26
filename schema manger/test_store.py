@@ -142,9 +142,54 @@ def main():
     assert store.get_process_task(sid, tmp, "b12345678") == process_task
     assert store.get_process_task(sid, os.path.join(tmp, "other-project"), "b12345678") is None
     assert store.list_process_tasks(sid, tmp) == [process_task]
+    for index in range(110):
+        store.save_process_task(sid, tmp, {
+            "schema_version": "1.0",
+            "task_id": f"b{index:08x}",
+            "type": "local_bash",
+            "status": "completed",
+            "output_file": os.path.join(tmp, f"output-{index}.log"),
+        })
+    assert len(store.list_process_tasks(sid, tmp, limit=None)) == 111
     store.delete_process_task(sid, tmp, "b12345678")
     assert store.get_process_task(sid, tmp, "b12345678") is None
     print("✅ Process handles persist with session/project isolation")
+
+    monitor_event = {
+        "event_id": "monitor-task:output:1",
+        "type": "monitor_output",
+        "session_id": sid,
+        "task_id": "monitor-task",
+        "owner_agent_id": None,
+        "message": "untrusted monitor output",
+        "truncated": False,
+        "dropped_before": 0,
+        "untrusted": True,
+    }
+    store.append_process_event(sid, tmp, "monitor-task", monitor_event)
+    store.append_process_event(sid, tmp, "monitor-task", monitor_event)
+    pending_events = store.list_pending_process_events(sid, tmp)
+    assert [row["event"] for row in pending_events] == [monitor_event]
+    store.close()
+    store = Store(db)
+    pending_events = store.list_pending_process_events(sid, tmp)
+    assert [row["event"] for row in pending_events] == [monitor_event]
+    store.acknowledge_process_event(sid, tmp, monitor_event["event_id"])
+    assert not store.list_pending_process_events(sid, tmp)
+    print("✅ Monitor outbox persists, deduplicates, and acknowledges across reopen")
+
+    store.save_process_task(sid, tmp, {
+        "schema_version": "1.0",
+        "task_id": "monitor-task",
+        "type": "monitor",
+        "status": "completed",
+        "output_file": os.path.join(tmp, "monitor.log"),
+    })
+    store.append_process_event(sid, tmp, "monitor-task", monitor_event)
+    store.delete_process_task(sid, tmp, "monitor-task")
+    assert not store.list_pending_process_events(sid, tmp)
+    print("✅ Forgetting a process task also clears its pending monitor events")
+
     assert store.get_task_run("run-1", os.path.join(tmp, "other-project")) is None
     assert store.get_task_run("run-1", tmp, "other-session") is None
     assert store.get_task_run("unknown-run", tmp) is None

@@ -1,6 +1,7 @@
 """Headless smoke tests for the Textual agent UI."""
 import asyncio
 import os
+import time
 
 os.environ["AGENT_STORE_PATH"] = ":memory:"
 
@@ -22,6 +23,8 @@ from ui import (
 
 
 async def main():
+    assert "/monitors" in ui.COMMANDS
+    assert "/task-forget" in ui.COMMANDS
     assert validate_server_name("github") == "github"
     assert validate_env_name("DOCS_API_KEY", "Bearer token variable") == "DOCS_API_KEY"
     for invalid_env in ("token-value", "ghp_example", "has spaces"):
@@ -31,6 +34,8 @@ async def main():
         except ValueError:
             pass
     assert validate_remote_url("https://mcp.example.test/mcp") == "https://mcp.example.test/mcp"
+    assert "/monitors" in ui.COMMANDS
+    assert "/task-forget" in ui.COMMANDS
     try:
         validate_remote_url("https://mcp.example.test/sse")
         raise AssertionError("legacy SSE endpoint was accepted")
@@ -55,7 +60,42 @@ async def main():
         "type": "stdio", "command": ["uvx", "trusted-mcp"], "env": {"TOKEN": "${TOKEN}"},
     })["args"] == ["trusted-mcp"]
 
+    previous_monitor_auto_wake = os.environ.get("AGENT_MONITOR_AUTO_WAKE")
+    os.environ["AGENT_MONITOR_AUTO_WAKE"] = "0"
     app = AgentApp()
+    monitor_event = {
+        "event_id": "monitor-ui-event-1",
+        "type": "monitor_output",
+        "session_id": app.ctx.session_id,
+        "task_id": "m12345678",
+        "owner_agent_id": None,
+        "message": "persisted monitor event",
+        "truncated": False,
+        "dropped_before": 0,
+        "untrusted": True,
+    }
+    app.ctx._store.append_process_event(
+        app.ctx.session_id,
+        app.ctx.project_root,
+        monitor_event["task_id"],
+        monitor_event,
+    )
+    app.ctx._store.save_process_task(app.ctx.session_id, app.ctx.project_root, {
+        "schema_version": "1.0",
+        "task_id": monitor_event["task_id"],
+        "type": "monitor",
+        "status": "completed",
+        "description": "UI monitor dashboard test",
+        "owner_agent_id": None,
+        "started_at": time.time() - 1,
+        "ended_at": time.time(),
+        "output_file": os.path.join(os.path.dirname(app.ctx._store.path), "monitor.log"),
+        "output_bytes": 0,
+        "completion_acknowledged": True,
+        "completion_suppressed": False,
+        "background_visible": True,
+        "notify_completion": False,
+    })
     async with app.run_test(size=(110, 32)) as pilot:
         assert app.query_one("#topbar")
         composer = app.query_one("#composer", Composer)
@@ -64,6 +104,27 @@ async def main():
         assert app.query_one("#activity-view")
         assert app.query_one("#runtime-view")
         assert app.query_one("#session-list", OptionList)
+        background_event = asyncio.Event()
+        app.ctx._foreground_background_event = background_event
+        app.ctx._foreground_background_task_id = "b12345678"
+        await pilot.press("ctrl+shift+b")
+        assert background_event.is_set()
+        app.ctx._foreground_background_event = None
+        app.ctx._foreground_background_task_id = None
+        await pilot.pause(1.0)
+        assert not app.ctx._store.list_pending_process_events(
+            app.ctx.session_id, app.ctx.project_root,
+        )
+        app._show_view("monitors-view")
+        dashboard_tasks = ui.get_background_task_manager(app.ctx).list_tasks()
+        assert any(task.get("task_id") == monitor_event["task_id"] for task in dashboard_tasks), dashboard_tasks
+        assert app._monitor_refresh_worker is not None
+        await app._monitor_refresh_worker.wait()
+        await pilot.pause()
+        assert len(app.query_one("#monitor-rows").query(ui.MonitorRow)) == 1
+        monitor_buttons = app.query_one("#monitor-rows").query(Button)
+        assert len(monitor_buttons) == 1
+        assert monitor_buttons.first().disabled
         await pilot.press("h", "i")
         assert composer.text == "hi"
         await pilot.press("ctrl+j")
@@ -393,6 +454,73 @@ async def main():
         await pilot.pause()
         assert not app.is_running
         await pilot.pause(0.1)
+    if previous_monitor_auto_wake is None:
+        os.environ.pop("AGENT_MONITOR_AUTO_WAKE", None)
+    else:
+        os.environ["AGENT_MONITOR_AUTO_WAKE"] = previous_monitor_auto_wake
+
+    previous_background_auto_wake = os.environ.get("AGENT_BACKGROUND_TASK_AUTO_WAKE")
+    previous_background_delay = os.environ.get("AGENT_BASH_AUTO_BACKGROUND_MS")
+    os.environ["AGENT_BACKGROUND_TASK_AUTO_WAKE"] = "0"
+    os.environ["AGENT_BASH_AUTO_BACKGROUND_MS"] = "0"
+    app = AgentApp()
+    bash_started = asyncio.Event()
+    original_query = ui.query
+
+    async def foreground_bash_query(params):
+        bash_started.set()
+
+        async def allow_tool(_decision):
+            return True
+
+        result = await ui.execute_tool(
+            {
+                "id": "ui-foreground-bash",
+                "name": "Bash",
+                "input": {
+                    "command": "printf 'foreground-started\\n'; sleep 1.5; printf 'foreground-completed\\n'",
+                    "timeout": 5_000,
+                },
+            },
+            params.tool_use_context,
+            allow_tool,
+        )
+        yield result.result_message
+        yield Terminal(reason="completed")
+
+    ui.query = foreground_bash_query
+    try:
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._start_turn("run the local foreground Bash test")
+            await asyncio.wait_for(bash_started.wait(), timeout=1)
+            for _ in range(100):
+                if getattr(app.ctx, "_foreground_background_event", None) is not None:
+                    break
+                await pilot.pause(0.01)
+            assert getattr(app.ctx, "_foreground_background_event", None) is not None
+            turn_worker = app._worker
+            assert turn_worker is not None
+            await pilot.press("ctrl+shift+b")
+            await turn_worker.wait()
+            manager = app.ctx._background_task_manager
+            tasks = manager.list_tasks()
+            task = next(item for item in tasks if item["type"] == "local_bash")
+            assert task["status"] in {"running", "completed"}
+            completed = await manager.wait(task["task_id"])
+            with open(completed["output_file"], encoding="utf-8") as output:
+                assert "foreground-completed" in output.read()
+            manager.forget(task["task_id"], delete_output=True)
+    finally:
+        ui.query = original_query
+        if previous_background_auto_wake is None:
+            os.environ.pop("AGENT_BACKGROUND_TASK_AUTO_WAKE", None)
+        else:
+            os.environ["AGENT_BACKGROUND_TASK_AUTO_WAKE"] = previous_background_auto_wake
+        if previous_background_delay is None:
+            os.environ.pop("AGENT_BASH_AUTO_BACKGROUND_MS", None)
+        else:
+            os.environ["AGENT_BASH_AUTO_BACKGROUND_MS"] = previous_background_delay
+
     query_started = asyncio.Event()
     query_closed = asyncio.Event()
 

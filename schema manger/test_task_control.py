@@ -10,10 +10,14 @@ from state import AppState, FileStateCache, ToolPermissionContext
 from store import Store
 from tool import ToolUseContext
 from tools.bash import BashTool
-from tools.task_control import TaskListTool, TaskStopTool
+from tools.task_control import TaskForgetTool, TaskListTool, TaskStopTool
+
+
+approval_messages = []
 
 
 async def approve(_decision):
+    approval_messages.append(_decision.message)
     return True
 
 
@@ -22,6 +26,7 @@ async def main():
     register(BashTool)
     register(TaskListTool)
     register(TaskStopTool)
+    register(TaskForgetTool)
     with tempfile.TemporaryDirectory() as root:
         state = AppState(
             messages=[],
@@ -62,7 +67,23 @@ async def main():
         }, context, approve)
         assert not stopped.is_error, stopped.result_message.content
         assert json.loads(stopped.result_message.content)["task"]["status"] == "cancelled"
+        assert "Stop background task" in approval_messages[-1]
         print("✅ TaskStop requests approval and terminates the owned process")
+
+        forgotten = await execute_tool({
+            "id": "forget-1",
+            "name": "TaskForget",
+            "input": {"task_id": task["task_id"]},
+        }, context, approve)
+        assert not forgotten.is_error, forgotten.result_message.content
+        assert json.loads(forgotten.result_message.content) == {
+            "forgotten_task_id": task["task_id"],
+            "output_deleted": True,
+        }
+        assert "permanently delete" in approval_messages[-1]
+        assert not os.path.exists(task["output_file"])
+        assert not context._background_task_manager.list_tasks()
+        print("✅ TaskForget asks approval and deletes the completed task output")
 
         await context._background_task_manager.close()
         context._store.close()

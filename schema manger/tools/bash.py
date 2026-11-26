@@ -260,7 +260,8 @@ class BashInput(BaseModel):
         default=False,
         description=(
             "Start this command as a managed background task and return its task ID. "
-            "Use TaskList to inspect it, TaskStop to stop it, and Read on its output file."
+            "Use TaskList to inspect it, TaskStop to stop it, TaskForget to delete "
+            "a completed task, and Read on its output file."
         ),
     )
     timeout: int | None = Field(
@@ -312,7 +313,8 @@ def _prompt() -> str:
         "longer operations.\n"
         "- For long-running work, set `run_in_background=true`. The result "
         "includes a task ID and private output-file path; use TaskList to inspect, "
-        "TaskStop to stop, and Read to inspect output. The timeout remains enforced.\n"
+        "TaskStop to stop, TaskForget to delete a completed task, and Read to inspect "
+        "output. The timeout remains enforced.\n"
         "- Chain commands with && when they depend on each other. Use ; only "
         "when you don't care about failure of earlier commands.\n"
         "- Always quote file paths with spaces: `ls \"/path with space\"`.\n"
@@ -739,7 +741,8 @@ def _map_result(data: dict, tool_use_id: str) -> dict:
         content = (
             f"Background task `{task_id}` started.\n"
             f"Output file: `{output_file}`\n"
-            "Use TaskList to check status, TaskStop to stop it, and Read to inspect output."
+            "Use TaskList to check status, TaskStop to stop it, TaskForget to delete "
+            "a completed task, and Read to inspect output."
         )
         return {
             "type": "tool_result",

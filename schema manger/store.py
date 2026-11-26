@@ -100,6 +100,19 @@ CREATE TABLE IF NOT EXISTS process_tasks (
 CREATE INDEX IF NOT EXISTS idx_process_tasks_session
     ON process_tasks(session_id, project_root, updated_at);
 
+CREATE TABLE IF NOT EXISTS process_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    task_id      TEXT NOT NULL,
+    event_id     TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    UNIQUE(session_id, project_root, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_process_events_pending
+    ON process_events(session_id, project_root, id);
+
 CREATE TABLE IF NOT EXISTS task_idempotency (
     session_id       TEXT NOT NULL,
     project_root     TEXT NOT NULL,
@@ -874,16 +887,24 @@ class Store:
         self,
         session_id: str,
         project_root: str,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[dict]:
         canonical_root = os.path.realpath(os.path.abspath(project_root))
-        bounded_limit = max(1, min(int(limit), 500))
-        rows = self.db.execute(
-            "SELECT payload FROM process_tasks "
-            "WHERE session_id = ? AND project_root = ? "
-            "ORDER BY updated_at DESC LIMIT ?",
-            (session_id, canonical_root, bounded_limit),
-        ).fetchall()
+        if limit is None:
+            rows = self.db.execute(
+                "SELECT payload FROM process_tasks "
+                "WHERE session_id = ? AND project_root = ? "
+                "ORDER BY updated_at DESC",
+                (session_id, canonical_root),
+            ).fetchall()
+        else:
+            bounded_limit = max(1, min(int(limit), 500))
+            rows = self.db.execute(
+                "SELECT payload FROM process_tasks "
+                "WHERE session_id = ? AND project_root = ? "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (session_id, canonical_root, bounded_limit),
+            ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
     def delete_process_task(
@@ -899,6 +920,109 @@ class Store:
                 "WHERE session_id = ? AND project_root = ? AND task_id = ?",
                 (session_id, canonical_root, task_id),
             )
+            self.db.execute(
+                "DELETE FROM process_events "
+                "WHERE session_id = ? AND project_root = ? AND task_id = ?",
+                (session_id, canonical_root, task_id),
+            )
+
+    def append_process_event(
+        self,
+        session_id: str,
+        project_root: str,
+        task_id: str,
+        event: dict,
+    ) -> int:
+        if (
+            not session_id
+            or not task_id
+            or not isinstance(event, dict)
+            or event.get("type") != "monitor_output"
+        ):
+            raise ValueError("Monitor events require a session, task, and monitor_output payload")
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id or len(event_id) > 160:
+            raise ValueError("Monitor event ID must contain 1-160 characters")
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        payload = json.dumps(event, ensure_ascii=True, sort_keys=True)
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO process_events "
+                "(session_id, project_root, task_id, event_id, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, canonical_root, task_id, event_id, payload, time.time()),
+            )
+            row = self.db.execute(
+                "SELECT id FROM process_events WHERE session_id = ? "
+                "AND project_root = ? AND event_id = ?",
+                (session_id, canonical_root, event_id),
+            ).fetchone()
+        return int(row["id"])
+
+    def list_pending_process_events(
+        self,
+        session_id: str,
+        project_root: str,
+        *,
+        after_id: int = 0,
+        limit: int = 20,
+    ) -> list[dict]:
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        bounded_limit = max(1, min(int(limit), 100))
+        rows = self.db.execute(
+            "SELECT id, payload FROM process_events WHERE session_id = ? "
+            "AND project_root = ? AND id > ? ORDER BY id LIMIT ?",
+            (session_id, canonical_root, max(0, int(after_id)), bounded_limit),
+        ).fetchall()
+        return [{"id": int(row["id"]), "event": json.loads(row["payload"])} for row in rows]
+
+    def acknowledge_process_event(
+        self,
+        session_id: str,
+        project_root: str,
+        event_id: str,
+    ) -> None:
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        with self.db:
+            self.db.execute(
+                "DELETE FROM process_events WHERE session_id = ? "
+                "AND project_root = ? AND event_id = ?",
+                (session_id, canonical_root, event_id),
+            )
+
+    def has_pending_process_event(
+        self,
+        session_id: str,
+        project_root: str,
+        event_id: str,
+    ) -> bool:
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        row = self.db.execute(
+            "SELECT 1 FROM process_events WHERE session_id = ? "
+            "AND project_root = ? AND event_id = ?",
+            (session_id, canonical_root, event_id),
+        ).fetchone()
+        return row is not None
+
+    def delete_process_events_for_task(
+        self,
+        session_id: str,
+        project_root: str,
+        task_id: str,
+    ) -> list[str]:
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        with self.db:
+            rows = self.db.execute(
+                "SELECT event_id FROM process_events WHERE session_id = ? "
+                "AND project_root = ? AND task_id = ?",
+                (session_id, canonical_root, task_id),
+            ).fetchall()
+            self.db.execute(
+                "DELETE FROM process_events WHERE session_id = ? "
+                "AND project_root = ? AND task_id = ?",
+                (session_id, canonical_root, task_id),
+            )
+        return [str(row["event_id"]) for row in rows]
 
     # ── View assembly (the "projection") ───────────────────────────────
 

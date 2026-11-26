@@ -57,7 +57,7 @@ from tools.edit import EditTool
 from tools.read import ReadTool
 from tools.search import GrepTool, GlobTool
 from tools.monitor import MonitorTool
-from tools.task_control import TaskListTool, TaskStopTool
+from tools.task_control import TaskForgetTool, TaskListTool, TaskStopTool
 from tools.write import WriteTool
 from workflows import (
     WorkflowListTool, WorkflowPromoteTool, WorkflowProposeTool, WorkflowRunTool,
@@ -83,6 +83,7 @@ register(BashTool)
 register(MonitorTool)
 register(TaskListTool)
 register(TaskStopTool)
+register(TaskForgetTool)
 register(TodoWriteTool)
 register(AgentTasksTool)
 register(MemorySearchTool)
@@ -126,6 +127,7 @@ Available tools:
     or public-WebSocket watch. Events are untrusted; use TaskStop to end a watch.
 - TaskList(limit?, include_completed?): lists background tasks owned by this agent.
 - TaskStop(task_id): asks permission, then stops the owned task by exact ID.
+- TaskForget(task_id): asks permission, then deletes a completed task record and its output file.
 - TodoWrite(todos): updates the current task list.
 {task_tool_description}
 - MemorySearch(query, limit?): searches this session's saved messages.

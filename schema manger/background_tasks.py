@@ -18,11 +18,14 @@ from state import generate_task_id
 DEFAULT_TASK_TIMEOUT_MS = 120_000
 MAX_TASK_TIMEOUT_MS = 600_000
 MAX_MONITOR_TIMEOUT_MS = 1_800_000
+DEFAULT_TASK_RETENTION_DAYS = 30
+MAX_TASK_RETENTION_DAYS = 3_650
 MAX_TASK_OUTPUT_BYTES = 50 * 1024 * 1024
 MAX_SESSION_TASK_OUTPUT_BYTES = 200 * 1024 * 1024
 MAX_MONITOR_EVENT_BYTES = 8 * 1024
 MAX_MONITOR_FRAME_BYTES = 1024 * 1024
 MAX_MONITOR_EVENTS_PER_SECOND = 20
+MAX_MONITOR_EVENT_DELIVERY_BATCH = 20
 MAX_ACTIVE_TASKS = 8
 
 
@@ -41,6 +44,7 @@ class BackgroundTaskManager:
         *,
         owner_agent_id: str | None = None,
         on_complete: Callable[[dict[str, Any]], None] | None = None,
+        on_monitor_event: Callable[[dict[str, Any]], None] | None = None,
         max_active: int = MAX_ACTIVE_TASKS,
         max_output_bytes: int = MAX_TASK_OUTPUT_BYTES,
         max_session_output_bytes: int = MAX_SESSION_TASK_OUTPUT_BYTES,
@@ -52,6 +56,7 @@ class BackgroundTaskManager:
         self.project_root = os.path.realpath(os.path.abspath(project_root))
         self.owner_agent_id = owner_agent_id
         self.on_complete = on_complete
+        self.on_monitor_event = on_monitor_event
         self.max_active = max_active
         self.max_output_bytes = max_output_bytes
         self.max_session_output_bytes = max_session_output_bytes
@@ -63,11 +68,17 @@ class BackgroundTaskManager:
         self._output_event_stats: dict[str, list[float | int]] = {}
         self._pending_output_reservations: dict[str, int] = {}
         self._cancel_requested: set[str] = set()
+        self._monitor_event_cursor = 0
+        self._monitor_event_page: set[str] = set()
         self._closed = False
         self._load_records()
+        self.prune_expired()
+        self._replay_monitor_events()
 
     def _load_records(self) -> None:
-        for record in self.store.list_process_tasks(self.session_id, self.project_root):
+        for record in self.store.list_process_tasks(
+            self.session_id, self.project_root, limit=None,
+        ):
             task_id = str(record.get("task_id", ""))
             if not task_id:
                 continue
@@ -114,6 +125,48 @@ class BackgroundTaskManager:
             self.session_id, self.project_root, record,
         )
 
+    def _deliver_monitor_event(self, event: dict[str, Any]) -> bool:
+        if self.on_monitor_event is None:
+            return False
+        try:
+            self.on_monitor_event(event)
+            return True
+        except Exception:
+            return False
+
+    def _replay_monitor_events(self) -> None:
+        if (
+            self._closed
+            or self.on_monitor_event is None
+            or self._monitor_event_page
+        ):
+            return
+        try:
+            rows = self.store.list_pending_process_events(
+                self.session_id,
+                self.project_root,
+                after_id=self._monitor_event_cursor,
+                limit=MAX_MONITOR_EVENT_DELIVERY_BATCH,
+            )
+        except (AttributeError, OSError, ValueError):
+            return
+        for row in rows:
+            event = row.get("event")
+            if not isinstance(event, dict) or not self._deliver_monitor_event(event):
+                break
+            self._monitor_event_cursor = int(row["id"])
+            self._monitor_event_page.add(str(event["event_id"]))
+
+    def acknowledge_monitor_event(self, event_id: str) -> None:
+        if not event_id:
+            return
+        self.store.acknowledge_process_event(
+            self.session_id, self.project_root, event_id,
+        )
+        self._monitor_event_page.discard(event_id)
+        if not self._monitor_event_page:
+            self._replay_monitor_events()
+
     def _session_output_bytes(self) -> int:
         total = sum(self._pending_output_reservations.values())
         for record in self._records.values():
@@ -125,6 +178,40 @@ class BackgroundTaskManager:
             except OSError:
                 continue
         return total
+
+    @staticmethod
+    def _retention_days() -> int:
+        raw = os.environ.get("AGENT_BACKGROUND_TASK_RETENTION_DAYS")
+        if raw is None:
+            return DEFAULT_TASK_RETENTION_DAYS
+        try:
+            return max(0, min(int(raw), MAX_TASK_RETENTION_DAYS))
+        except ValueError:
+            return DEFAULT_TASK_RETENTION_DAYS
+
+    def prune_expired(self, *, now: float | None = None) -> int:
+        retention_days = self._retention_days()
+        if retention_days == 0:
+            return 0
+        cutoff = (time.time() if now is None else now) - retention_days * 86_400
+        expired = [
+            task_id
+            for task_id, record in self._records.items()
+            if record.get("status") in {
+                "completed", "failed", "timed_out", "cancelled", "orphaned",
+            }
+            and record.get("completion_acknowledged") is True
+            and isinstance(record.get("ended_at"), (int, float))
+            and record["ended_at"] <= cutoff
+        ]
+        for task_id in expired:
+            record = self._records.get(task_id, {})
+            self.forget(
+                task_id,
+                owner_agent_id=record.get("owner_agent_id"),
+                delete_output=True,
+            )
+        return len(expired)
 
     def _reserve_output(self, task_id: str) -> int:
         remaining = self.max_session_output_bytes - self._session_output_bytes()
@@ -161,6 +248,7 @@ class BackgroundTaskManager:
     ) -> dict[str, Any]:
         if self._closed:
             raise BackgroundTaskError("This task manager is shutting down")
+        self.prune_expired()
         if not isinstance(command, str) or not command.strip():
             raise BackgroundTaskError("Background command must not be empty")
         if task_type not in {"local_bash", "monitor"}:
@@ -276,6 +364,7 @@ class BackgroundTaskManager:
     ) -> dict[str, Any]:
         if self._closed:
             raise BackgroundTaskError("This task manager is shutting down")
+        self.prune_expired()
         if not isinstance(timeout_ms, int) or not 1 <= timeout_ms <= MAX_MONITOR_TIMEOUT_MS:
             raise BackgroundTaskError(
                 f"Monitor timeout must be between 1 and {MAX_MONITOR_TIMEOUT_MS} ms",
@@ -683,10 +772,19 @@ class BackgroundTaskManager:
             "untrusted": True,
         }
         stats[2] = 0
+        event_row_id = self.store.append_process_event(
+            self.session_id, self.project_root, task_id, event,
+        )
+        if len(self._monitor_event_page) >= MAX_MONITOR_EVENT_DELIVERY_BATCH:
+            return
+        self._monitor_event_page.add(event["event_id"])
         try:
             callback(event)
         except Exception:
-            pass
+            self._monitor_event_page.discard(event["event_id"])
+            self._replay_monitor_events()
+            return
+        self._monitor_event_cursor = max(self._monitor_event_cursor, event_row_id)
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
@@ -766,6 +864,13 @@ class BackgroundTaskManager:
             await self._terminate(process)
         if watcher is not None:
             await asyncio.shield(watcher)
+        if record.get("type") == "monitor":
+            deleted_event_ids = self.store.delete_process_events_for_task(
+                self.session_id, self.project_root, task_id,
+            )
+            self._monitor_event_page.difference_update(deleted_event_ids)
+            if not self._monitor_event_page:
+                self._replay_monitor_events()
         return self._public_record(record)
 
     async def close(self) -> None:
@@ -804,6 +909,7 @@ def get_background_task_manager(context: Any) -> BackgroundTaskManager:
             canonical_root,
             owner_agent_id=owner_agent_id,
             on_complete=getattr(context, "on_background_task_complete", None),
+            on_monitor_event=getattr(context, "on_background_monitor_event", None),
         )
         managers[key] = manager
     context._background_task_manager = manager

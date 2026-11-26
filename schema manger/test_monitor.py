@@ -2,7 +2,9 @@
 import asyncio
 import os
 import tempfile
+from unittest.mock import patch
 
+import chainlit_app
 from execute import execute_tool
 from registry import clear, register
 from state import AppState, FileStateCache, ToolPermissionContext
@@ -75,6 +77,27 @@ async def main():
             assert ws_result["status"] == "completed", ws_result
             assert events[-1]["message"] == "websocket ready"
         print("✅ WebSocket monitor emits frames and completes on clean close")
+
+        delivered_messages = []
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+            async def send(self):
+                delivered_messages.append(self.content)
+
+        websocket_event = events[-1]
+        context._pending_monitor_events = [websocket_event]
+        context._monitor_flush_scheduled = True
+        with patch.dict(os.environ, {"AGENT_MONITOR_AUTO_WAKE": "0"}), \
+             patch.object(chainlit_app.cl, "Message", FakeMessage):
+            await chainlit_app._flush_monitor_events(context)
+        assert delivered_messages
+        assert not context._store.has_pending_process_event(
+            context.session_id, root, websocket_event["event_id"],
+        )
+        print("✅ Chainlit surfaces and acknowledges a persisted Monitor event")
 
         for unsafe in (
             "ws://public.example/socket",
